@@ -1,0 +1,11 @@
+[package]
+name = "converter-core"
+version = "0.1.0"
+edition = "2021"
+description = "Genomics file format conversion for Universal Gene Tool"
+
+[dependencies]
+anyhow = "1"
+flate2 = "1"
+noodles = { version = "0.87", features = ["fasta", "fastq", "sam", "vcf", "gff", "bed", "cram", "bam", "bgzf"] }
+thiserror = "2"
