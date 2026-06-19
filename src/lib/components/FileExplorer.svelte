@@ -8,15 +8,19 @@
   interface Props {
     selectedPaths?: string[];
     disabled?: boolean;
+    showSetAsReference?: boolean;
     onchange?: (paths: string[]) => void;
     onSetOutputFolder?: (path: string) => void;
+    onSetAsReference?: (path: string) => void;
   }
 
   let {
     selectedPaths = $bindable([]),
     disabled = false,
+    showSetAsReference = false,
     onchange,
     onSetOutputFolder,
+    onSetAsReference,
   }: Props = $props();
 
   let rootPath = $state("");
@@ -158,10 +162,17 @@
     }
   }
 
-  async function reloadExpandedTree() {
+  async function reloadExpandedTree(force = true) {
     const dirs = [...expandedDirs].sort((left, right) => left.length - right.length);
     for (const dir of dirs) {
-      await loadDirectory(dir, true);
+      await loadDirectory(dir, force);
+      if (folderFilesCache[dir]) {
+        try {
+          await cacheFolderFiles(dir);
+        } catch {
+          // Ignore stale folder cache refresh errors.
+        }
+      }
     }
   }
 
@@ -224,9 +235,9 @@
     );
   }
 
-  async function ensureExpanded(path: string) {
+  async function ensureExpanded(path: string, force = false) {
     expandedDirs = new Set([...expandedDirs, path]);
-    await loadDirectory(path);
+    await loadDirectory(path, force);
   }
 
   async function toggleExpand(path: string) {
@@ -236,7 +247,11 @@
       expandedDirs = next;
       return;
     }
-    await ensureExpanded(path);
+    await ensureExpanded(path, true);
+  }
+
+  function isFastaPath(path: string) {
+    return /\.(fasta|fa|fna|ffn)(\.gz)?$/i.test(path);
   }
 
   async function toggleCheck(entry: DirEntry) {
@@ -484,6 +499,16 @@
     onSetOutputFolder?.(path);
   }
 
+  function setAsReference(path: string) {
+    closeContextMenu();
+    onSetAsReference?.(path);
+  }
+
+  async function refreshCurrentView() {
+    closeContextMenu();
+    await refreshTree();
+  }
+
   async function deleteItem(path: string, isDirHint?: boolean) {
     if (disabled) return;
     closeContextMenu();
@@ -549,6 +574,38 @@
 
   type VisibleNode = { entry: DirEntry; depth: number };
 
+  function pathBreadcrumbs(path: string): { label: string; path: string }[] {
+    const normalized = path.replace(/[\\/]+$/, "");
+    if (!normalized) return [];
+
+    const crumbs: { label: string; path: string }[] = [];
+    const driveMatch = normalized.match(/^([A-Za-z]:)(?:[\\/]|$)/);
+    if (driveMatch) {
+      let current = `${driveMatch[1]}\\`;
+      crumbs.push({ label: driveMatch[1], path: current });
+      const rest = normalized
+        .slice(driveMatch[0].length)
+        .split(/[\\/]/)
+        .filter(Boolean);
+      for (const part of rest) {
+        current = `${current.replace(/[\\/]+$/, "")}\\${part}`;
+        crumbs.push({ label: part, path: current });
+      }
+      return crumbs;
+    }
+
+    const parts = normalized.split(/[\\/]/).filter(Boolean);
+    let current = parts[0].startsWith("/") ? parts[0] : `/${parts[0]}`;
+    crumbs.push({ label: parts[0], path: current });
+    for (const part of parts.slice(1)) {
+      current = `${current.replace(/\/+$/, "")}/${part}`;
+      crumbs.push({ label: part, path: current });
+    }
+    return crumbs;
+  }
+
+  const breadcrumbs = $derived(pathBreadcrumbs(rootPath));
+
   function visibleNodes(): VisibleNode[] {
     const nodes: VisibleNode[] = [];
     const walk = (dirPath: string, depth: number) => {
@@ -575,14 +632,21 @@
 >
   <div class="toolbar">
     <button class="ghost" onclick={goUp} disabled={disabled || !rootPath}>↑ Up</button>
+    <button
+      class="ghost icon-btn"
+      onclick={() => void refreshCurrentView()}
+      disabled={disabled}
+      title="Refresh"
+      aria-label="Refresh"
+    >
+      ↻
+    </button>
     <button class="ghost" onclick={changeRoot} disabled={disabled}>Change root</button>
     <button class="ghost" onclick={clearSelection} disabled={disabled || selectedCount === 0}>
       Clear selection
     </button>
     <span class="selection-count">{selectedCount} file{selectedCount === 1 ? "" : "s"} selected</span>
   </div>
-
-  <p class="root-label" title={rootPath}>Root: {rootPath}</p>
 
   {#if errorMessage}
     <p class="explorer-error">{errorMessage}</p>
@@ -592,7 +656,21 @@
     <div class="tree-header">
       <span class="col-expand"></span>
       <span class="col-check"></span>
-      <span class="col-name">Name</span>
+      <nav class="col-name breadcrumb" aria-label="Current root folder">
+        {#each breadcrumbs as crumb, index}
+          {#if index > 0}
+            <span class="crumb-sep">\</span>
+          {/if}
+          <button
+            class="crumb-btn"
+            class:current={crumb.path === rootPath}
+            title={crumb.path}
+            onclick={() => void setRootFromFolder(crumb.path)}
+          >
+            {crumb.label}
+          </button>
+        {/each}
+      </nav>
     </div>
 
     <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -717,6 +795,14 @@
       >
         New folder
       </button>
+      <button class="context-item" disabled={disabled} onclick={() => void refreshCurrentView()}>
+        Refresh
+      </button>
+      {#if showSetAsReference && !contextMenu.isDir && isFastaPath(contextMenu.path)}
+        <button class="context-item" disabled={disabled} onclick={() => setAsReference(contextMenu!.path)}>
+          Set as reference
+        </button>
+      {/if}
       {#if contextMenu.isDir}
         <button
           class="context-item"
@@ -755,14 +841,11 @@
     font-weight: 600;
   }
 
-  .root-label {
-    margin: 0;
-    color: #94a3b8;
-    font-size: 0.82rem;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    flex-shrink: 0;
+  .icon-btn {
+    min-width: 38px;
+    padding-inline: 10px;
+    font-size: 1.05rem;
+    line-height: 1;
   }
 
   .explorer-error {
@@ -795,10 +878,45 @@
     padding: 8px 12px;
     border-bottom: 1px solid rgba(148, 163, 184, 0.12);
     color: #94a3b8;
-    font-size: 0.76rem;
-    text-transform: uppercase;
-    letter-spacing: 0.06em;
+    font-size: 0.82rem;
     flex-shrink: 0;
+  }
+
+  .breadcrumb {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .crumb-sep {
+    color: #64748b;
+    user-select: none;
+  }
+
+  .crumb-btn {
+    border: none;
+    background: none;
+    color: #94a3b8;
+    cursor: pointer;
+    padding: 2px 4px;
+    border-radius: 6px;
+    font: inherit;
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .crumb-btn:hover {
+    color: #ecfeff;
+    background: rgba(51, 65, 85, 0.45);
+  }
+
+  .crumb-btn.current {
+    color: #e2e8f0;
+    font-weight: 600;
   }
 
   .tree-body {

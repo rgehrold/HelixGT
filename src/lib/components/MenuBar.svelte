@@ -1,7 +1,14 @@
 <script lang="ts">
   import { getCurrentWindow } from "@tauri-apps/api/window";
 
-  type MenuId = "file" | "about" | "help" | null;
+  interface Props {
+    onPrint?: () => void;
+    onRestoreView?: () => void;
+  }
+
+  let { onPrint, onRestoreView }: Props = $props();
+
+  type MenuId = "file" | "view" | "about" | "help" | null;
 
   let openMenu = $state<MenuId>(null);
 
@@ -21,8 +28,18 @@
   function showAbout() {
     closeMenus();
     alert(
-      "Universal Gene Tool\n\nConvert FASTA, FASTQ, GenBank, GFF, BED, SAM, BAM, CRAM, and VCF files on Windows.",
+      "Universal Gene Tool\n\nConvert, merge, and align genomics files on Windows.\n\nSupported formats: FASTA, FASTQ, GenBank, GFF, BED, SAM, BAM, CRAM, and VCF.",
     );
+  }
+
+  function printPage() {
+    closeMenus();
+    onPrint?.();
+  }
+
+  function restoreView() {
+    closeMenus();
+    onRestoreView?.();
   }
 </script>
 
@@ -32,14 +49,26 @@
   <span class="app-title">Universal Gene Tool</span>
 
   <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="menus" role="menubar" onclick={(event) => event.stopPropagation()}>
+  <div class="menus" role="menubar" tabindex="0" onclick={(event) => event.stopPropagation()}>
     <div class="menu-group">
       <button class="menu-trigger" class:active={openMenu === "file"} onclick={() => toggleMenu("file")}>
         File
       </button>
       {#if openMenu === "file"}
         <div class="dropdown">
+          <button class="dropdown-item" onclick={printPage}>Print…</button>
           <button class="dropdown-item" onclick={exitApp}>Exit</button>
+        </div>
+      {/if}
+    </div>
+
+    <div class="menu-group">
+      <button class="menu-trigger" class:active={openMenu === "view"} onclick={() => toggleMenu("view")}>
+        View
+      </button>
+      {#if openMenu === "view"}
+        <div class="dropdown">
+          <button class="dropdown-item" onclick={restoreView}>Restore standard view</button>
         </div>
       {/if}
     </div>
@@ -74,7 +103,6 @@
     align-items: center;
     gap: 18px;
     padding: 0 4px 10px;
-    border-bottom: 1px solid rgba(148, 163, 184, 0.12);
     flex-shrink: 0;
   }
 

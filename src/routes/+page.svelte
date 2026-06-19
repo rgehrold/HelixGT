@@ -4,9 +4,21 @@
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { open } from "@tauri-apps/plugin-dialog";
   import { onMount } from "svelte";
+  import AlignPane from "$lib/components/AlignPane.svelte";
   import FileExplorer from "$lib/components/FileExplorer.svelte";
+  import MergePane from "$lib/components/MergePane.svelte";
   import MenuBar from "$lib/components/MenuBar.svelte";
-  import type { ConvertProgress, ConvertSummary, FormatInfo } from "$lib/types";
+  import { inferLogLevel } from "$lib/log";
+  import HelpTip from "$lib/components/HelpTip.svelte";
+  import type {
+    ConvertProgress,
+    ConvertSummary,
+    FormatInfo,
+    LogEntry,
+    LogLevel,
+    ToolLogEvent,
+    ToolMode,
+  } from "$lib/types";
 
   let formats = $state<FormatInfo[]>([]);
   let selectedPaths = $state<string[]>([]);
@@ -14,19 +26,42 @@
   let outputFormat = $state("fasta");
   let compress = $state(true);
   let prefix = $state("");
+  let referencePath = $state("");
+  let minimap2Available = $state(false);
+  let samtoolsAvailable = $state(false);
   let isConverting = $state(false);
   let isDragging = $state(false);
   let progress = $state<ConvertProgress | null>(null);
-  let logs = $state<string[]>([]);
-  let errorMessage = $state("");
+  let logs = $state<LogEntry[]>([]);
+  let toolLogs = $state<LogEntry[]>([]);
+  let logTab = $state<"activity" | "tools">("activity");
   let lastSummary = $state<ConvertSummary | null>(null);
   let fileExplorer = $state<{
     revealPaths: (paths: string[]) => Promise<void>;
     refreshTree: () => Promise<void>;
   } | null>(null);
+  let alignPane = $state<{
+    loadReferenceFromPath: (path: string) => Promise<void>;
+  } | null>(null);
   let filesPaneWidth = $state(58);
   let isResizing = $state(false);
-  let logEl = $state<HTMLPreElement | null>(null);
+  let logEl = $state<HTMLDivElement | null>(null);
+  let activeMode = $state<ToolMode>("convert");
+  let isMerging = $state(false);
+  let isAligning = $state(false);
+  let isBusy = $derived(isConverting || isMerging || isAligning);
+
+  $effect(() => {
+    if (isAligning) logTab = "tools";
+  });
+
+  const selectedHasCram = $derived(selectedPaths.some((path) => /\.cram$/i.test(path)));
+
+  const needsReferenceForConvert = $derived(
+    activeMode === "convert" && (outputFormat === "cram" || selectedHasCram),
+  );
+
+  const showSetAsReference = $derived(activeMode === "align" || needsReferenceForConvert);
 
   const categoryLabels: Record<string, string> = {
     sequence: "Sequence",
@@ -37,6 +72,8 @@
 
   $effect(() => {
     logs;
+    toolLogs;
+    logTab;
     if (logEl) {
       logEl.scrollTop = logEl.scrollHeight;
     }
@@ -45,11 +82,21 @@
   onMount(async () => {
     pushLog("Ready.");
     formats = await invoke<FormatInfo[]>("get_supported_formats");
+    minimap2Available = await invoke<boolean>("minimap2_is_available");
+    samtoolsAvailable = await invoke<boolean>("samtools_is_available");
+
+    await listen<ToolLogEvent>("tool-log", (event) => {
+      const { tool, stream, line } = event.payload;
+      pushToolLog(`[${tool} ${stream}] ${line}`);
+    });
     await listen<ConvertProgress>("convert-progress", (event) => {
       progress = event.payload;
       logs = [
         ...logs,
-        `[${event.payload.current}/${event.payload.total}] ${event.payload.fileName}`,
+        {
+          level: "info" as const,
+          message: `[${event.payload.current}/${event.payload.total}] ${event.payload.fileName}`,
+        },
       ];
     });
 
@@ -65,8 +112,52 @@
     });
   });
 
-  function pushLog(message: string) {
-    logs = [...logs, message];
+  function pushLog(message: string, level?: LogLevel) {
+    logs = [...logs, { level: level ?? inferLogLevel(message), message }];
+  }
+
+  function pushToolLog(message: string, level?: LogLevel) {
+    toolLogs = [...toolLogs, { level: level ?? inferLogLevel(message), message }];
+  }
+
+  function alignmentIndexPath(outputPath: string): string | null {
+    if (outputPath.endsWith(".bam")) return `${outputPath}.bai`;
+    if (outputPath.endsWith(".cram")) return `${outputPath}.crai`;
+    return null;
+  }
+
+  function collectOutputPaths(paths: string[]) {
+    const all = [...paths];
+    for (const path of paths) {
+      const indexPath = alignmentIndexPath(path);
+      if (indexPath) all.push(indexPath);
+    }
+    return all;
+  }
+
+  async function setReferenceFromBrowser(path: string) {
+    if (activeMode === "convert") {
+      referencePath = path;
+      pushLog(`Reference set to ${path}`);
+      return;
+    }
+    if (activeMode === "align") {
+      await alignPane?.loadReferenceFromPath(path);
+    }
+  }
+
+  function restoreStandardView() {
+    filesPaneWidth = 58;
+    activeMode = "convert";
+    logTab = "activity";
+    void fileExplorer?.refreshTree();
+    pushLog("Restored standard view and refreshed file browser.");
+  }
+
+  function handleAppContextMenu(event: MouseEvent) {
+    if (!(event.target as HTMLElement).closest(".explorer")) {
+      event.preventDefault();
+    }
   }
 
   async function addPaths(paths: string[]) {
@@ -75,7 +166,7 @@
     const merged = new Set([...selectedPaths, ...valid]);
     selectedPaths = [...merged].sort();
     if (valid.length < paths.length) {
-      pushLog(`Skipped ${paths.length - valid.length} unsupported file(s).`);
+      pushLog(`Skipped ${paths.length - valid.length} unsupported file(s).`, "warn");
     }
     if (valid.length > 0) {
       pushLog(`Added ${valid.length} file(s) from drag and drop.`);
@@ -114,20 +205,65 @@
     if (picked) outputDir = String(picked);
   }
 
+  async function browseReferenceFasta() {
+    const picked = await open({
+      directory: false,
+      multiple: false,
+      title: "Choose reference FASTA for CRAM",
+      filters: [{ name: "FASTA", extensions: ["fasta", "fa", "fna", "gz"] }],
+    });
+    if (picked) referencePath = String(picked);
+  }
+
+  const alignmentInputPaths = $derived(
+    selectedPaths.filter((path) => /\.(sam|bam|cram)(\.gz)?$/i.test(path)),
+  );
+
   function onDragOver(event: DragEvent) {
     event.preventDefault();
   }
 
   async function startConversion() {
-    errorMessage = "";
     lastSummary = null;
 
     if (selectedPaths.length === 0) {
-      errorMessage = "Select at least one compatible input file in the browser.";
+      pushLog("Select at least one compatible input file in the browser.", "error");
       return;
     }
     if (!outputDir.trim()) {
-      errorMessage = "Choose an output folder.";
+      pushLog("Choose an output folder.", "error");
+      return;
+    }
+
+    const inputPaths =
+      outputFormat === "cram"
+        ? alignmentInputPaths
+        : selectedPaths;
+
+    if (needsReferenceForConvert) {
+      if (!referencePath.trim()) {
+        pushLog("Choose a reference FASTA for CRAM conversion or decoding.", "error");
+        return;
+      }
+      if (!samtoolsAvailable) {
+        pushLog("CRAM conversion requires samtools on PATH or in src-tauri/binaries/.", "error");
+        return;
+      }
+    }
+
+    if (outputFormat === "cram") {
+      if (inputPaths.length === 0) {
+        pushLog("Select at least one SAM or BAM file to convert to CRAM.", "error");
+        return;
+      }
+      if (inputPaths.length < selectedPaths.length) {
+        pushLog(
+          `Converting ${inputPaths.length} alignment file(s); skipped ${selectedPaths.length - inputPaths.length} non-alignment file(s).`,
+          "warn",
+        );
+      }
+    } else if (inputPaths.length === 0) {
+      pushLog("Select at least one compatible input file in the browser.", "error");
       return;
     }
 
@@ -138,11 +274,12 @@
     try {
       const summary = await invoke<ConvertSummary>("run_conversion", {
         request: {
-          inputPaths: selectedPaths,
+          inputPaths,
           outputDir: outputDir.trim(),
           outputFormat,
           compress,
           prefix: prefix.trim() || null,
+          referencePath: needsReferenceForConvert ? referencePath.trim() : null,
         },
       });
       lastSummary = summary;
@@ -150,13 +287,12 @@
         `Done — ${summary.files.length} file(s), ${summary.totalRecords.toLocaleString()} records.`,
       );
       await fileExplorer?.refreshTree();
-      const outputPaths = summary.files.map((file) => file.outputPath);
+      const outputPaths = collectOutputPaths(summary.files.map((file) => file.outputPath));
       if (outputPaths.length > 0) {
         await fileExplorer?.revealPaths(outputPaths);
       }
     } catch (error) {
-      errorMessage = String(error);
-      pushLog(`Error: ${errorMessage}`);
+      pushLog(`Error: ${String(error)}`, "error");
     } finally {
       isConverting = false;
       progress = null;
@@ -164,8 +300,9 @@
   }
 </script>
 
-<div class="app">
-  <MenuBar />
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div class="app" oncontextmenu={handleAppContextMenu}>
+  <MenuBar onPrint={() => window.print()} onRestoreView={restoreStandardView} />
 
   <main class="workspace" class:resizing={isResizing} style={`--files-width:${filesPaneWidth}%`}>
     <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -178,11 +315,13 @@
       <FileExplorer
         bind:this={fileExplorer}
         bind:selectedPaths
-        disabled={isConverting}
+        disabled={isBusy}
+        {showSetAsReference}
         onSetOutputFolder={(path) => {
           outputDir = path;
           pushLog(`Output folder set to ${path}`);
         }}
+        onSetAsReference={(path) => void setReferenceFromBrowser(path)}
       />
     </section>
 
@@ -198,10 +337,22 @@
     <div class="right-column">
     <section class="panel settings-panel">
       <div class="panel-head">
-        <h2>Conversion</h2>
+        <h2>Tools</h2>
+        <div class="mode-tabs">
+          <button class="mode-tab" class:active={activeMode === "convert"} onclick={() => (activeMode = "convert")}>
+            Convert
+          </button>
+          <button class="mode-tab" class:active={activeMode === "merge"} onclick={() => (activeMode = "merge")}>
+            Merge
+          </button>
+          <button class="mode-tab" class:active={activeMode === "align"} onclick={() => (activeMode = "align")}>
+            Align
+          </button>
+        </div>
       </div>
 
       <div class="settings-scroll">
+      {#if activeMode === "convert"}
       <label class="field">
         <span>Output format</span>
         <div class="format-groups">
@@ -214,7 +365,7 @@
                     class="pill"
                     class:active={outputFormat === format.id}
                     onclick={() => (outputFormat = format.id)}
-                    disabled={isConverting}
+                    disabled={isBusy}
                   >
                     {format.label}
                   </button>
@@ -239,9 +390,34 @@
       </label>
 
       <label class="toggle">
-        <input type="checkbox" bind:checked={compress} disabled={isConverting} />
+        <input type="checkbox" bind:checked={compress} disabled={isConverting || outputFormat === "cram"} />
         <span>Gzip compress text outputs (.gz)</span>
+        <HelpTip text="Applies to text formats such as FASTA, FASTQ, SAM, GFF, and VCF. Binary BAM/CRAM are always compressed internally." />
       </label>
+
+      {#if needsReferenceForConvert}
+        <label class="field">
+          <span class="label-with-help">
+            <span>Reference FASTA (required for CRAM)</span>
+            <HelpTip text="CRAM stores differences against a reference FASTA. Required when converting to or from CRAM. The app also looks for a matching FASTA next to each CRAM file. Right-click a FASTA and choose Set as reference." />
+          </span>
+          <div class="row">
+            <input
+              bind:value={referencePath}
+              placeholder="C:\path\to\reference.fasta"
+              disabled={isConverting}
+            />
+            <button class="ghost" onclick={browseReferenceFasta} disabled={isConverting}>Choose</button>
+          </div>
+          <p class="subtle">
+            {#if outputFormat === "cram"}
+              Applies to all selected SAM/BAM files ({alignmentInputPaths.length} of {selectedPaths.length} selected).
+            {:else if selectedHasCram}
+              Used to decode {selectedPaths.filter((path) => /\.cram$/i.test(path)).length} selected CRAM file(s).
+            {/if}
+          </p>
+        </label>
+      {/if}
 
       <button class="primary" onclick={startConversion} disabled={isConverting}>
         {isConverting ? "Converting…" : "Run conversion"}
@@ -254,24 +430,74 @@
         <p class="progress-label">{progress.current} / {progress.total} — {progress.fileName}</p>
       {/if}
 
-      {#if errorMessage}
-        <p class="error">{errorMessage}</p>
-      {/if}
-
       {#if lastSummary}
         <div class="success">
           <strong>Conversion complete</strong>
           <p>{lastSummary.files.length} files · {lastSummary.totalRecords.toLocaleString()} records</p>
         </div>
       {/if}
+      {:else if activeMode === "merge"}
+        <MergePane
+          {selectedPaths}
+          {outputDir}
+          disabled={isBusy}
+          onOutputDirChange={(value) => (outputDir = value)}
+          onLog={pushLog}
+          onBusyChange={(busy) => (isMerging = busy)}
+          onComplete={async (outputPath) => {
+            await fileExplorer?.refreshTree();
+            await fileExplorer?.revealPaths([outputPath]);
+          }}
+        />
+      {:else}
+        <AlignPane
+          bind:this={alignPane}
+          {selectedPaths}
+          {outputDir}
+          disabled={isBusy}
+          {minimap2Available}
+          {samtoolsAvailable}
+          onOutputDirChange={(value) => (outputDir = value)}
+          onLog={pushLog}
+          onBusyChange={(busy) => (isAligning = busy)}
+          onComplete={async (outputPaths) => {
+            await fileExplorer?.refreshTree();
+            await fileExplorer?.revealPaths(collectOutputPaths(outputPaths));
+          }}
+        />
+      {/if}
       </div>
     </section>
 
     <section class="panel log-panel">
       <div class="panel-head">
-        <h2>Activity</h2>
+        <h2>Logs</h2>
+        <div class="log-tabs">
+          <button class="log-tab" class:active={logTab === "activity"} onclick={() => (logTab = "activity")}>
+            Activity
+          </button>
+          <button class="log-tab" class:active={logTab === "tools"} onclick={() => (logTab = "tools")}>
+            Tools
+          </button>
+        </div>
       </div>
-      <pre class="log" bind:this={logEl}>{logs.join("\n")}</pre>
+      <div class="log" bind:this={logEl}>
+        {#if logTab === "activity"}
+          {#each logs as entry}
+            <div class="log-line" class:log-error={entry.level === "error"} class:log-warn={entry.level === "warn"}>
+              {entry.message}
+            </div>
+          {/each}
+        {:else if toolLogs.length === 0}
+          <div class="log-line">Tool output from minimap2 and samtools appears here during alignment.</div>
+        {:else}
+          {#each toolLogs as entry}
+            <div class="log-line" class:log-error={entry.level === "error"} class:log-warn={entry.level === "warn"}>
+              {entry.message}
+            </div>
+          {/each}
+        {/if}
+      </div>
     </section>
     </div>
   </main>
@@ -412,6 +638,30 @@
     letter-spacing: 0.02em;
   }
 
+  .mode-tabs {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+
+  .mode-tab {
+    cursor: pointer;
+    border: 1px solid rgba(148, 163, 184, 0.16);
+    background: rgba(30, 41, 59, 0.75);
+    color: #cbd5e1;
+    padding: 6px 12px;
+    border-radius: 999px;
+    font-size: 0.82rem;
+    font-weight: 600;
+  }
+
+  .mode-tab.active {
+    color: #ecfeff;
+    border-color: rgba(103, 232, 249, 0.45);
+    background: linear-gradient(135deg, rgba(34, 211, 238, 0.22), rgba(16, 185, 129, 0.22));
+  }
+
   .field {
     display: flex;
     flex-direction: column;
@@ -420,10 +670,24 @@
   }
 
   .field > span,
-  .toggle span {
+  .toggle span,
+  .label-with-help {
     color: #cbd5e1;
     font-size: 0.92rem;
     font-weight: 500;
+  }
+
+  .label-with-help {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .subtle {
+    margin: 0;
+    color: #94a3b8;
+    font-size: 0.82rem;
+    line-height: 1.45;
   }
 
   .row {
@@ -515,6 +779,29 @@
     align-items: center;
     gap: 10px;
     margin-bottom: 8px;
+    flex-wrap: wrap;
+  }
+
+  .log-tabs {
+    display: flex;
+    gap: 6px;
+  }
+
+  .log-tab {
+    cursor: pointer;
+    border: 1px solid rgba(148, 163, 184, 0.16);
+    background: rgba(30, 41, 59, 0.75);
+    color: #cbd5e1;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 0.78rem;
+    font-weight: 600;
+  }
+
+  .log-tab.active {
+    color: #ecfeff;
+    border-color: rgba(103, 232, 249, 0.45);
+    background: linear-gradient(135deg, rgba(34, 211, 238, 0.22), rgba(16, 185, 129, 0.22));
   }
 
   .progress-wrap {
@@ -533,15 +820,9 @@
   }
 
   .progress-label,
-  .error,
   .success p {
     margin: 8px 0 0;
     font-size: 0.9rem;
-  }
-
-  .error {
-    color: #fca5a5;
-    white-space: pre-wrap;
   }
 
   .success {
@@ -565,7 +846,19 @@
     font-family: "JetBrains Mono", monospace;
     font-size: 0.78rem;
     line-height: 1.5;
+  }
+
+  .log-line {
     white-space: pre-wrap;
+    margin-bottom: 2px;
+  }
+
+  .log-line.log-error {
+    color: #f87171;
+  }
+
+  .log-line.log-warn {
+    color: #fb923c;
   }
 
   @media (max-width: 980px) {

@@ -27,6 +27,7 @@ pub fn convert_genbank(
                     output_format: FileFormat::Fasta,
                     compress: false,
                     prefix: String::new(),
+                    reference_path: None,
                 },
             )?;
             let count = super::sequence::convert_sequence(
@@ -37,6 +38,7 @@ pub fn convert_genbank(
                     output_format: FileFormat::Fastq,
                     compress: options.compress,
                     prefix: String::new(),
+                    reference_path: None,
                 },
             )?;
             let _ = std::fs::remove_file(temp);
@@ -67,6 +69,7 @@ pub fn sequence_to_genbank(
                     output_format: FileFormat::Fasta,
                     compress: false,
                     prefix: String::new(),
+                    reference_path: None,
                 },
             )?;
             let count = fasta_to_genbank(&temp, output_path, options)?;

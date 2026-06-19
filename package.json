@@ -1,7 +1,7 @@
 {
   "name": "universal-gene-tool",
-  "version": "0.1.0",
-  "description": "",
+  "version": "0.2.0",
+  "description": "Windows desktop app for genomics file conversion, merging, and read alignment",
   "type": "module",
   "scripts": {
     "dev": "vite dev",

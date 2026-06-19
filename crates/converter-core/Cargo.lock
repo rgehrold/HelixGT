@@ -303,6 +303,7 @@ dependencies = [
  "noodles-bam",
  "noodles-bed",
  "noodles-bgzf",
+ "noodles-core",
  "noodles-cram",
  "noodles-fasta",
  "noodles-fastq",

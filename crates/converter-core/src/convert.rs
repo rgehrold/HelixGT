@@ -33,12 +33,14 @@ impl Write for TextWriter {
     }
 }
 
+use crate::external::index_alignment_output_if_needed;
 use crate::format::{infer_format, is_gzipped, output_filename, FileFormat};
 
 pub struct ConvertOptions {
     pub output_format: FileFormat,
     pub compress: bool,
     pub prefix: String,
+    pub reference_path: Option<PathBuf>,
 }
 
 pub struct ConvertedFile {
@@ -126,6 +128,7 @@ pub fn convert_file(input_path: &Path, output_path: &Path, options: &ConvertOpti
                 output_format: FileFormat::Fastq,
                 compress: options.compress,
                 prefix: String::new(),
+                reference_path: None,
             },
         )
         .with_context(|| format!("writing bridged fastq ({input_format} → fastq)"))?;
@@ -152,7 +155,7 @@ fn transcode_same_format(
         FileFormat::Bed => sequence::copy_bed(input_path, output_path, options),
         FileFormat::Sam => alignment::transcode_sam(input_path, output_path, options),
         FileFormat::Bam => alignment::copy_bam(input_path, output_path),
-        FileFormat::Cram => alignment::copy_cram(input_path, output_path),
+        FileFormat::Cram => alignment::copy_cram(input_path, output_path, options),
         FileFormat::Vcf => variants::convert_vcf(input_path, output_path, options),
         FileFormat::GenBank => genbank::copy_genbank(input_path, output_path, options),
     }
@@ -189,6 +192,7 @@ fn bridge_through_fasta(
                 output_format: FileFormat::Fasta,
                 compress: false,
                 prefix: String::new(),
+                reference_path: None,
             },
         )?;
     } else if input_format == FileFormat::GenBank {
@@ -201,6 +205,7 @@ fn bridge_through_fasta(
                 output_format: FileFormat::Fasta,
                 compress: false,
                 prefix: String::new(),
+                reference_path: None,
             },
         )?;
     } else {
@@ -247,6 +252,12 @@ pub fn batch_convert(
                 options.output_format
             )
         })?;
+
+        if matches!(options.output_format, FileFormat::Bam | FileFormat::Cram) {
+            index_alignment_output_if_needed(&output_path).with_context(|| {
+                format!("failed to index '{}'", output_path.display())
+            })?;
+        }
 
         results.push(ConvertedFile {
             input_path: input_path.clone(),

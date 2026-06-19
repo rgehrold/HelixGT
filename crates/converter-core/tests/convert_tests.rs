@@ -44,6 +44,7 @@ fn fastq_gz_to_fastq_decompresses() {
             output_format: FileFormat::Fastq,
             compress: false,
             prefix: String::new(),
+            reference_path: None,
         },
     )
     .expect("fastq.gz → fastq conversion should succeed");
@@ -76,6 +77,7 @@ fn fastq_gz_to_fasta_converts_all_records() {
             output_format: FileFormat::Fastq,
             compress: false,
             prefix: String::new(),
+            reference_path: None,
         },
     )
     .expect("decompress fastq");
@@ -88,6 +90,7 @@ fn fastq_gz_to_fasta_converts_all_records() {
             output_format: FileFormat::Fasta,
             compress: false,
             prefix: String::new(),
+            reference_path: None,
         },
     )
     .expect("fastq.gz → fasta conversion should succeed");
@@ -125,6 +128,7 @@ fn multi_member_gzip_reads_all_fastq_records() {
             output_format: FileFormat::Fasta,
             compress: false,
             prefix: String::new(),
+            reference_path: None,
         },
     )
     .expect("multi-member gzip fastq.gz → fasta should succeed");
@@ -152,6 +156,7 @@ fn fastq_gz_to_fasta_works() {
             output_format: FileFormat::Fasta,
             compress: false,
             prefix: String::new(),
+            reference_path: None,
         },
     )
     .expect("fastq.gz → fasta conversion should succeed");
@@ -177,6 +182,7 @@ fn fastq_to_fastq_can_recompress() {
             output_format: FileFormat::Fastq,
             compress: false,
             prefix: String::new(),
+            reference_path: None,
         },
     )
     .unwrap();
@@ -189,6 +195,7 @@ fn fastq_to_fastq_can_recompress() {
             output_format: FileFormat::Fastq,
             compress: true,
             prefix: String::new(),
+            reference_path: None,
         },
     )
     .expect("plain fastq → gzipped fastq should succeed");
