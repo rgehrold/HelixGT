@@ -1,4 +1,4 @@
-# Universal Gene Tool
+# HelixGT
 
 A native Windows desktop app for genomics file conversion, merging, and read alignment. Built with **Rust**, **Tauri**, **Svelte**, and **noodles**, with **minimap2** and **samtools** for alignment and CRAM support.
 
@@ -45,7 +45,7 @@ See [`src-tauri/binaries/README.txt`](src-tauri/binaries/README.txt) for details
 
 ```powershell
 git clone <repo-url>
-cd Universal_Gene_Tool
+cd HelixGT
 npm install
 npm run tauri dev
 ```
@@ -68,7 +68,7 @@ You only do a full release build when you want a distributable app.
 ## Project layout
 
 ```
-Universal_Gene_Tool/
+HelixGT/
 ├── crates/converter-core/   # Rust engine: convert, merge, align, references
 ├── src/                     # Svelte frontend
 ├── src-tauri/               # Tauri shell, filesystem commands, reference cache

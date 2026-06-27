@@ -47,6 +47,12 @@ Desktop.ini
 *.swo
 *~
 
+# Design explorations (kept locally)
+/design/
+
+# Per-user UI state (defaults live in code; this file is created at runtime)
+helixgt-user.json
+
 # Local test fixtures and outputs
 /test
 

@@ -440,7 +440,7 @@
   }
 
   .field-inline > span {
-    color: #94a3b8;
+    color: var(--text-muted);
     font-size: 0.82rem;
   }
 
@@ -454,7 +454,7 @@
   .field > span,
   .field-label > span,
   .toggle span {
-    color: #cbd5e1;
+    color: var(--text-menu);
     font-size: 0.92rem;
     font-weight: 500;
   }
@@ -465,7 +465,7 @@
 
   .subtle {
     margin: 0;
-    color: #94a3b8;
+    color: var(--text-muted);
     font-size: 0.82rem;
     line-height: 1.45;
     word-break: break-word;
@@ -476,9 +476,9 @@
     width: 100%;
     padding: 11px 12px;
     border-radius: 12px;
-    border: 1px solid rgba(148, 163, 184, 0.18);
-    background: rgba(15, 23, 42, 0.85);
-    color: #e8eef8;
+    border: 1px solid var(--input-border);
+    background: var(--input-bg);
+    color: var(--text-primary);
   }
 
   .row {
@@ -501,15 +501,15 @@
   .pill {
     padding: 8px 12px;
     border-radius: 999px;
-    background: rgba(30, 41, 59, 0.9);
-    color: #cbd5e1;
-    border: 1px solid rgba(148, 163, 184, 0.14);
+    background: var(--chip-bg);
+    color: var(--text-menu);
+    border: 1px solid var(--chip-border);
   }
 
   .pill.active {
-    background: linear-gradient(135deg, rgba(34, 211, 238, 0.22), rgba(16, 185, 129, 0.22));
-    color: #ecfeff;
-    border-color: rgba(103, 232, 249, 0.45);
+    background: var(--chip-active-bg);
+    color: var(--chip-active-text);
+    border-color: var(--chip-active-border);
   }
 
   .ghost,
@@ -520,17 +520,17 @@
   }
 
   .ghost {
-    background: rgba(30, 41, 59, 0.9);
-    color: #e2e8f0;
-    border: 1px solid rgba(148, 163, 184, 0.16);
+    background: var(--chip-bg);
+    color: var(--text-primary);
+    border: 1px solid var(--chip-border);
   }
 
   .primary {
     width: 100%;
     margin-top: 8px;
-    background: linear-gradient(135deg, #0891b2, #059669);
-    color: white;
-    box-shadow: 0 10px 30px rgba(8, 145, 178, 0.25);
+    background: var(--primary-bg);
+    color: var(--primary-text);
+    box-shadow: var(--primary-shadow);
   }
 
   .pill:disabled,
@@ -552,19 +552,19 @@
     padding: 10px 12px;
     border-radius: 12px;
     font-size: 0.88rem;
-    border: 1px solid rgba(148, 163, 184, 0.16);
+    border: 1px solid var(--chip-border);
   }
 
   .status.ok {
-    border-color: rgba(52, 211, 153, 0.25);
-    background: rgba(6, 78, 59, 0.22);
-    color: #d1fae5;
+    border-color: var(--success-border);
+    background: var(--success-bg);
+    color: var(--accent-highlight);
   }
 
   .status.bad {
-    border-color: rgba(248, 113, 113, 0.25);
-    background: rgba(127, 29, 29, 0.22);
-    color: #fecaca;
+    border-color: var(--status-error-border);
+    background: var(--status-error-bg);
+    color: var(--status-error-text);
   }
 
   .status p {
@@ -584,7 +584,7 @@
     padding: 0;
     border: none;
     background: none;
-    color: #67e8f9;
+    color: var(--link-color);
     cursor: pointer;
     font-size: 0.82rem;
     text-decoration: underline;
@@ -598,26 +598,26 @@
   .progress-wrap {
     height: 8px;
     border-radius: 999px;
-    background: rgba(30, 41, 59, 0.95);
+    background: var(--progress-track);
     overflow: hidden;
   }
 
   .progress-bar {
     height: 100%;
     border-radius: inherit;
-    background: linear-gradient(90deg, #22d3ee, #34d399);
+    background: var(--progress-fill);
     transition: width 0.2s ease;
   }
 
   .progress-label {
     margin: 0;
-    color: #94a3b8;
+    color: var(--text-muted);
     font-size: 0.8rem;
   }
 
   .note {
     margin: 0 0 12px;
-    color: #94a3b8;
+    color: var(--text-muted);
     font-size: 0.82rem;
     line-height: 1.45;
   }
@@ -625,15 +625,15 @@
   .note code {
     font-family: "JetBrains Mono", monospace;
     font-size: 0.76rem;
-    color: #bae6fd;
+    color: var(--code-color);
   }
 
   .success {
     margin-top: 12px;
     padding: 12px 14px;
     border-radius: 14px;
-    background: rgba(6, 78, 59, 0.28);
-    border: 1px solid rgba(52, 211, 153, 0.25);
+    background: var(--success-bg);
+    border: 1px solid var(--success-border);
   }
 
   .success p {

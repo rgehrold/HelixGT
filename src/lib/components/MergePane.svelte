@@ -178,7 +178,7 @@
 
   .intro {
     margin: 0 0 14px;
-    color: #94a3b8;
+    color: var(--text-muted);
     font-size: 0.88rem;
     line-height: 1.5;
   }
@@ -188,29 +188,29 @@
     padding: 10px 12px;
     border-radius: 12px;
     font-size: 0.88rem;
-    border: 1px solid rgba(148, 163, 184, 0.16);
-    background: rgba(30, 41, 59, 0.55);
+    border: 1px solid var(--chip-border);
+    background: var(--chip-bg);
   }
 
   .status.ok {
-    border-color: rgba(52, 211, 153, 0.25);
-    background: rgba(6, 78, 59, 0.22);
-    color: #a7f3d0;
+    border-color: var(--success-border);
+    background: var(--success-bg);
+    color: var(--accent-highlight);
   }
 
   .status.bad {
-    border-color: rgba(248, 113, 113, 0.25);
-    background: rgba(127, 29, 29, 0.22);
-    color: #fecaca;
+    border-color: var(--status-error-border);
+    background: var(--status-error-bg);
+    color: var(--status-error-text);
   }
 
   .hint-box {
     margin-bottom: 14px;
     padding: 10px 12px;
     border-radius: 12px;
-    border: 1px solid rgba(103, 232, 249, 0.2);
-    background: rgba(8, 47, 73, 0.28);
-    color: #bae6fd;
+    border: 1px solid var(--chip-active-border);
+    background: var(--tree-focus);
+    color: var(--code-color);
     font-size: 0.84rem;
   }
 
@@ -238,7 +238,7 @@
 
   .field > span,
   .toggle span {
-    color: #cbd5e1;
+    color: var(--text-menu);
     font-size: 0.92rem;
     font-weight: 500;
   }
@@ -252,9 +252,9 @@
     width: 100%;
     padding: 11px 12px;
     border-radius: 12px;
-    border: 1px solid rgba(148, 163, 184, 0.18);
-    background: rgba(15, 23, 42, 0.85);
-    color: #e8eef8;
+    border: 1px solid var(--input-border);
+    background: var(--input-bg);
+    color: var(--text-primary);
   }
 
   .ghost,
@@ -267,17 +267,17 @@
   }
 
   .ghost {
-    background: rgba(30, 41, 59, 0.9);
-    color: #e2e8f0;
-    border: 1px solid rgba(148, 163, 184, 0.16);
+    background: var(--chip-bg);
+    color: var(--text-primary);
+    border: 1px solid var(--chip-border);
   }
 
   .primary {
     width: 100%;
     margin-top: 8px;
-    background: linear-gradient(135deg, #0891b2, #059669);
-    color: white;
-    box-shadow: 0 10px 30px rgba(8, 145, 178, 0.25);
+    background: var(--primary-bg);
+    color: var(--primary-text);
+    box-shadow: var(--primary-shadow);
   }
 
   .primary:disabled,
@@ -297,8 +297,8 @@
     margin-top: 12px;
     padding: 12px 14px;
     border-radius: 14px;
-    background: rgba(6, 78, 59, 0.28);
-    border: 1px solid rgba(52, 211, 153, 0.25);
+    background: var(--success-bg);
+    border: 1px solid var(--success-border);
   }
 
   .success p {

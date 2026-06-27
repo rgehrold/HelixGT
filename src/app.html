@@ -1,7 +1,17 @@
 <!doctype html>
-<html lang="en">
+<html lang="en" data-palette="blue" data-mode="dark">
   <head>
     <meta charset="utf-8" />
+    <script>
+      try {
+        const saved = JSON.parse(localStorage.getItem("helixgt-theme") || "{}");
+        document.documentElement.dataset.palette = saved.palette === "orange" ? "orange" : "blue";
+        document.documentElement.dataset.mode = saved.mode === "light" ? "light" : "dark";
+      } catch {
+        document.documentElement.dataset.palette = "blue";
+        document.documentElement.dataset.mode = "dark";
+      }
+    </script>
     <link rel="icon" href="%sveltekit.assets%/favicon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -10,7 +20,7 @@
       href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=JetBrains+Mono:wght@400;500&display=swap"
       rel="stylesheet"
     />
-    <title>Universal Gene Tool</title>
+    <title>HelixGT</title>
     %sveltekit.head%
   </head>
   <body data-sveltekit-preload-data="hover">

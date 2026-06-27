@@ -2,7 +2,7 @@
 name = "converter-core"
 version = "0.1.0"
 edition = "2021"
-description = "Genomics file format conversion for Universal Gene Tool"
+description = "Genomics file format conversion for HelixGT"
 
 [dependencies]
 anyhow = "1"

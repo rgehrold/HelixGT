@@ -1,5 +1,6 @@
 mod filesystem;
 mod reference;
+mod user_preferences;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,6 +19,7 @@ use filesystem::{
     collect_compatible_files, create_folder, default_browse_root, delete_path,
     folder_child_count, folder_has_compatible_files, list_directory, rename_path, DirEntry,
 };
+use user_preferences::UserPreferences;
 use serde::Serialize;
 use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Emitter, Manager};
@@ -173,6 +175,16 @@ fn get_supported_formats() -> Vec<FormatInfo> {
 #[tauri::command]
 fn get_default_browse_root() -> String {
     default_browse_root().display().to_string()
+}
+
+#[tauri::command]
+fn load_user_preferences(app: AppHandle) -> UserPreferences {
+    crate::user_preferences::load_user_preferences(&app)
+}
+
+#[tauri::command]
+fn save_user_preferences(app: AppHandle, prefs: UserPreferences) -> Result<(), String> {
+    crate::user_preferences::save_user_preferences(&app, prefs)
 }
 
 #[tauri::command]
@@ -500,6 +512,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_supported_formats,
             get_default_browse_root,
+            load_user_preferences,
+            save_user_preferences,
             list_browse_directory,
             collect_compatible_files_under,
             browse_folder_has_compatible_files,

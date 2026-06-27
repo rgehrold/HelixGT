@@ -73,7 +73,7 @@ impl ReferenceStore {
     pub fn new() -> Self {
         Self {
             client: Client::builder()
-                .user_agent("UniversalGeneTool/0.1")
+                .user_agent("HelixGT/0.1")
                 .timeout(Duration::from_secs(3600))
                 .connect_timeout(Duration::from_secs(60))
                 .build()

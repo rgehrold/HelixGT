@@ -1,8 +1,9 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Universal Gene Tool",
+  "productName": "HelixGT",
+  "mainBinaryName": "HelixGT",
   "version": "0.1.0",
-  "identifier": "com.universalgenetool.app",
+  "identifier": "com.helixgt.app",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +13,7 @@
   "app": {
     "windows": [
       {
-        "title": "Universal Gene Tool",
+        "title": "HelixGT",
         "width": 1180,
         "height": 760,
         "minWidth": 960,

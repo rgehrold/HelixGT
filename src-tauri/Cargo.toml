@@ -1,12 +1,12 @@
 [package]
-name = "universal-gene-tool"
+name = "helixgt"
 version = "0.1.0"
-description = "Universal Gene Tool — genomics file converter"
-authors = ["Robin"]
+description = "HelixGT — genomics toolkit"
+authors = ["rgehrold"]
 edition = "2021"
 
 [lib]
-name = "universal_gene_tool_lib"
+name = "helixgt_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

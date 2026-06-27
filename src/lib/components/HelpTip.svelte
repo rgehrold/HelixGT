@@ -32,9 +32,9 @@
     padding: 0;
     margin: 0;
     border-radius: 999px;
-    border: 1px solid rgba(148, 163, 184, 0.28);
-    background: rgba(30, 41, 59, 0.8);
-    color: #94a3b8;
+    border: 1px solid var(--help-border);
+    background: var(--help-bg);
+    color: var(--text-muted);
     font-size: 0.72rem;
     font-weight: 700;
     cursor: help;
@@ -46,8 +46,8 @@
 
   .help-btn:hover,
   .help-btn:focus-visible {
-    color: #67e8f9;
-    border-color: rgba(103, 232, 249, 0.4);
+    color: var(--link-color);
+    border-color: var(--chip-active-border);
   }
 
   .help-tip:hover .help-tooltip,
@@ -67,9 +67,9 @@
     max-width: 280px;
     padding: 8px 10px;
     border-radius: 10px;
-    border: 1px solid rgba(103, 232, 249, 0.18);
-    background: rgba(8, 47, 73, 0.96);
-    color: #cbd5e1;
+    border: 1px solid var(--help-tooltip-border);
+    background: var(--help-tooltip-bg);
+    color: var(--text-menu);
     font-size: 0.78rem;
     font-weight: 400;
     line-height: 1.45;

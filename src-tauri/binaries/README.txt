@@ -1,4 +1,4 @@
-Runtime binaries bundled with Universal Gene Tool.
+Runtime binaries bundled with HelixGT.
 
 Tracked in git (Windows):
   minimap2.exe

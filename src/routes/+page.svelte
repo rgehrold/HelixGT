@@ -10,6 +10,13 @@
   import MenuBar from "$lib/components/MenuBar.svelte";
   import { inferLogLevel } from "$lib/log";
   import HelpTip from "$lib/components/HelpTip.svelte";
+  import { clampFilesPaneWidth } from "$lib/layout";
+  import {
+    defaultFilesPaneWidth,
+    loadUserPreferences,
+    patchUserPreferences,
+    saveUserPreferencesNow,
+  } from "$lib/userPreferences";
   import type {
     ConvertProgress,
     ConvertSummary,
@@ -79,37 +86,62 @@
     }
   });
 
-  onMount(async () => {
-    pushLog("Ready.");
-    formats = await invoke<FormatInfo[]>("get_supported_formats");
-    minimap2Available = await invoke<boolean>("minimap2_is_available");
-    samtoolsAvailable = await invoke<boolean>("samtools_is_available");
+  onMount(() => {
+    const onWindowResize = () => {
+      syncPaneWidthToWorkspace(document.querySelector(".workspace"));
+    };
+    window.addEventListener("resize", onWindowResize);
 
-    await listen<ToolLogEvent>("tool-log", (event) => {
-      const { tool, stream, line } = event.payload;
-      pushToolLog(`[${tool} ${stream}] ${line}`);
-    });
-    await listen<ConvertProgress>("convert-progress", (event) => {
-      progress = event.payload;
-      logs = [
-        ...logs,
-        {
-          level: "info" as const,
-          message: `[${event.payload.current}/${event.payload.total}] ${event.payload.fileName}`,
-        },
-      ];
-    });
-
-    await getCurrentWebview().onDragDropEvent((event) => {
-      if (event.payload.type === "drop") {
-        isDragging = false;
-        void addPaths(event.payload.paths);
-      } else if (event.payload.type === "over") {
-        isDragging = true;
-      } else {
-        isDragging = false;
+    void (async () => {
+      try {
+        const prefs = await loadUserPreferences();
+        if (typeof prefs.filesPaneWidth === "number") {
+          filesPaneWidth = prefs.filesPaneWidth;
+        }
+        queueMicrotask(() => syncPaneWidthToWorkspace(document.querySelector(".workspace")));
+      } catch (error) {
+        pushLog(`Could not load saved layout: ${String(error)}`, "warn");
       }
-    });
+
+      pushLog("Ready.");
+      try {
+        formats = await invoke<FormatInfo[]>("get_supported_formats");
+      } catch (error) {
+        pushLog(`Could not load output formats: ${String(error)}`, "error");
+      }
+      minimap2Available = await invoke<boolean>("minimap2_is_available");
+      samtoolsAvailable = await invoke<boolean>("samtools_is_available");
+
+      await listen<ToolLogEvent>("tool-log", (event) => {
+        const { tool, stream, line } = event.payload;
+        pushToolLog(`[${tool} ${stream}] ${line}`);
+      });
+      await listen<ConvertProgress>("convert-progress", (event) => {
+        progress = event.payload;
+        logs = [
+          ...logs,
+          {
+            level: "info" as const,
+            message: `[${event.payload.current}/${event.payload.total}] ${event.payload.fileName}`,
+          },
+        ];
+      });
+
+      await getCurrentWebview().onDragDropEvent((event) => {
+        if (event.payload.type === "drop") {
+          isDragging = false;
+          void addPaths(event.payload.paths);
+        } else if (event.payload.type === "over") {
+          isDragging = true;
+        } else {
+          isDragging = false;
+        }
+      });
+    })();
+
+    return () => {
+      window.removeEventListener("resize", onWindowResize);
+    };
   });
 
   function pushLog(message: string, level?: LogLevel) {
@@ -147,11 +179,22 @@
   }
 
   function restoreStandardView() {
-    filesPaneWidth = 58;
+    filesPaneWidth = defaultFilesPaneWidth();
+    patchUserPreferences({ filesPaneWidth: filesPaneWidth });
     activeMode = "convert";
     logTab = "activity";
     void fileExplorer?.refreshTree();
     pushLog("Restored standard view and refreshed file browser.");
+  }
+
+  function syncPaneWidthToWorkspace(workspace: Element | null) {
+    if (!workspace) return;
+    const rect = workspace.getBoundingClientRect();
+    const clamped = clampFilesPaneWidth(filesPaneWidth, rect.width);
+    if (clamped !== filesPaneWidth) {
+      filesPaneWidth = clamped;
+      patchUserPreferences({ filesPaneWidth: clamped });
+    }
   }
 
   function handleAppContextMenu(event: MouseEvent) {
@@ -183,11 +226,13 @@
     const onMove = (moveEvent: MouseEvent) => {
       const rect = workspace.getBoundingClientRect();
       const next = ((moveEvent.clientX - rect.left) / rect.width) * 100;
-      filesPaneWidth = Math.min(78, Math.max(32, next));
+      filesPaneWidth = clampFilesPaneWidth(next, rect.width);
     };
 
     const onUp = () => {
       isResizing = false;
+      patchUserPreferences({ filesPaneWidth });
+      saveUserPreferencesNow();
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
@@ -511,9 +556,9 @@
     overflow: hidden;
     padding: 12px 20px 14px;
     background:
-      radial-gradient(circle at top left, rgba(34, 211, 238, 0.12), transparent 28%),
-      radial-gradient(circle at 85% 10%, rgba(16, 185, 129, 0.1), transparent 24%),
-      #070b14;
+      radial-gradient(circle at top left, var(--bg-glow-1), transparent 28%),
+      radial-gradient(circle at 85% 10%, var(--bg-glow-2), transparent 24%),
+      var(--bg-base);
   }
 
   .workspace {
@@ -547,13 +592,13 @@
   }
 
   .files-panel.dragging {
-    outline: 1px dashed rgba(103, 232, 249, 0.55);
+    outline: 1px dashed var(--drag-outline);
     outline-offset: -1px;
-    background: rgba(8, 47, 73, 0.22);
+    background: var(--drag-bg);
   }
 
   .panel-hint {
-    color: #94a3b8;
+    color: var(--text-muted);
     font-size: 0.78rem;
     white-space: nowrap;
   }
@@ -564,20 +609,22 @@
   }
 
   .resize-handle {
+    flex: 0 0 10px;
     width: 10px;
+    min-width: 10px;
     margin: 0 6px;
     border-radius: 999px;
     cursor: col-resize;
-    background: linear-gradient(180deg, rgba(148, 163, 184, 0.08), rgba(148, 163, 184, 0.22));
-    border: 1px solid rgba(148, 163, 184, 0.12);
+    background: var(--resize-bg);
+    border: 1px solid var(--resize-border);
     align-self: stretch;
     transition: background 0.15s ease, border-color 0.15s ease;
   }
 
   .resize-handle:hover,
   .workspace.resizing .resize-handle {
-    background: linear-gradient(180deg, rgba(34, 211, 238, 0.18), rgba(16, 185, 129, 0.18));
-    border-color: rgba(103, 232, 249, 0.35);
+    background: var(--resize-hover-bg);
+    border-color: var(--resize-hover-border);
   }
 
   .right-column {
@@ -591,12 +638,12 @@
   }
 
   .panel {
-    background: rgba(10, 16, 28, 0.82);
-    border: 1px solid rgba(148, 163, 184, 0.14);
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-border);
     border-radius: 20px;
     padding: 18px;
     backdrop-filter: blur(10px);
-    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.22);
+    box-shadow: var(--panel-shadow);
     min-height: 0;
   }
 
@@ -647,9 +694,9 @@
 
   .mode-tab {
     cursor: pointer;
-    border: 1px solid rgba(148, 163, 184, 0.16);
-    background: rgba(30, 41, 59, 0.75);
-    color: #cbd5e1;
+    border: 1px solid var(--chip-border);
+    background: var(--chip-bg);
+    color: var(--text-menu);
     padding: 6px 12px;
     border-radius: 999px;
     font-size: 0.82rem;
@@ -657,9 +704,9 @@
   }
 
   .mode-tab.active {
-    color: #ecfeff;
-    border-color: rgba(103, 232, 249, 0.45);
-    background: linear-gradient(135deg, rgba(34, 211, 238, 0.22), rgba(16, 185, 129, 0.22));
+    color: var(--chip-active-text);
+    border-color: var(--chip-active-border);
+    background: var(--chip-active-bg);
   }
 
   .field {
@@ -672,7 +719,7 @@
   .field > span,
   .toggle span,
   .label-with-help {
-    color: #cbd5e1;
+    color: var(--text-menu);
     font-size: 0.92rem;
     font-weight: 500;
   }
@@ -685,7 +732,7 @@
 
   .subtle {
     margin: 0;
-    color: #94a3b8;
+    color: var(--text-muted);
     font-size: 0.82rem;
     line-height: 1.45;
   }
@@ -699,9 +746,9 @@
     width: 100%;
     padding: 11px 12px;
     border-radius: 12px;
-    border: 1px solid rgba(148, 163, 184, 0.18);
-    background: rgba(15, 23, 42, 0.85);
-    color: #e8eef8;
+    border: 1px solid var(--input-border);
+    background: var(--input-bg);
+    color: var(--text-primary);
   }
 
   .format-groups {
@@ -712,7 +759,7 @@
 
   .format-group p {
     margin: 0 0 6px;
-    color: #94a3b8;
+    color: var(--text-muted);
     font-size: 0.78rem;
     text-transform: uppercase;
     letter-spacing: 0.08em;
@@ -734,16 +781,16 @@
   .pill {
     padding: 8px 12px;
     border-radius: 999px;
-    background: rgba(30, 41, 59, 0.9);
-    color: #cbd5e1;
-    border: 1px solid rgba(148, 163, 184, 0.14);
+    background: var(--chip-bg);
+    color: var(--text-menu);
+    border: 1px solid var(--chip-border);
     transition: all 0.15s ease;
   }
 
   .pill.active {
-    background: linear-gradient(135deg, rgba(34, 211, 238, 0.22), rgba(16, 185, 129, 0.22));
-    color: #ecfeff;
-    border-color: rgba(103, 232, 249, 0.45);
+    background: var(--chip-active-bg);
+    color: var(--chip-active-text);
+    border-color: var(--chip-active-border);
   }
 
   .ghost,
@@ -754,17 +801,17 @@
   }
 
   .ghost {
-    background: rgba(30, 41, 59, 0.9);
-    color: #e2e8f0;
-    border: 1px solid rgba(148, 163, 184, 0.16);
+    background: var(--chip-bg);
+    color: var(--text-primary);
+    border: 1px solid var(--chip-border);
   }
 
   .primary {
     width: 100%;
     margin-top: 8px;
-    background: linear-gradient(135deg, #0891b2, #059669);
-    color: white;
-    box-shadow: 0 10px 30px rgba(8, 145, 178, 0.25);
+    background: var(--primary-bg);
+    color: var(--primary-text);
+    box-shadow: var(--primary-shadow);
   }
 
   .primary:disabled,
@@ -789,9 +836,9 @@
 
   .log-tab {
     cursor: pointer;
-    border: 1px solid rgba(148, 163, 184, 0.16);
-    background: rgba(30, 41, 59, 0.75);
-    color: #cbd5e1;
+    border: 1px solid var(--chip-border);
+    background: var(--chip-bg);
+    color: var(--text-menu);
     padding: 4px 10px;
     border-radius: 999px;
     font-size: 0.78rem;
@@ -799,23 +846,23 @@
   }
 
   .log-tab.active {
-    color: #ecfeff;
-    border-color: rgba(103, 232, 249, 0.45);
-    background: linear-gradient(135deg, rgba(34, 211, 238, 0.22), rgba(16, 185, 129, 0.22));
+    color: var(--chip-active-text);
+    border-color: var(--chip-active-border);
+    background: var(--chip-active-bg);
   }
 
   .progress-wrap {
     margin-top: 14px;
     height: 8px;
     border-radius: 999px;
-    background: rgba(30, 41, 59, 0.95);
+    background: var(--progress-track);
     overflow: hidden;
   }
 
   .progress-bar {
     height: 100%;
     border-radius: inherit;
-    background: linear-gradient(90deg, #22d3ee, #34d399);
+    background: var(--progress-fill);
     transition: width 0.2s ease;
   }
 
@@ -829,8 +876,8 @@
     margin-top: 12px;
     padding: 12px 14px;
     border-radius: 14px;
-    background: rgba(6, 78, 59, 0.28);
-    border: 1px solid rgba(52, 211, 153, 0.25);
+    background: var(--success-bg);
+    border: 1px solid var(--success-border);
   }
 
   .log {
@@ -840,9 +887,9 @@
     overflow: auto;
     padding: 14px;
     border-radius: 14px;
-    background: rgba(2, 6, 23, 0.72);
-    border: 1px solid rgba(148, 163, 184, 0.1);
-    color: #a5b4fc;
+    background: var(--log-surface-bg);
+    border: 1px solid var(--log-surface-border);
+    color: var(--log-text);
     font-family: "JetBrains Mono", monospace;
     font-size: 0.78rem;
     line-height: 1.5;
@@ -854,11 +901,11 @@
   }
 
   .log-line.log-error {
-    color: #f87171;
+    color: var(--error);
   }
 
   .log-line.log-warn {
-    color: #fb923c;
+    color: var(--warn);
   }
 
   @media (max-width: 980px) {

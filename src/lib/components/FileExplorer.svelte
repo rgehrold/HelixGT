@@ -4,6 +4,7 @@
   import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
   import { onMount, tick } from "svelte";
   import type { DirEntry } from "$lib/types";
+  import { loadUserPreferences, patchUserPreferences } from "$lib/userPreferences";
 
   interface Props {
     selectedPaths?: string[];
@@ -43,10 +44,35 @@
   const selectedSet = $derived(new Set(selectedPaths));
   const selectedCount = $derived(selectedPaths.length);
 
-  onMount(async () => {
-    rootPath = await invoke<string>("get_default_browse_root");
-    expandedDirs = new Set([rootPath]);
-    await loadDirectory(rootPath);
+  function persistBrowseState() {
+    if (!rootPath) return;
+    patchUserPreferences({
+      browseRoot: rootPath,
+      expandedDirs: [...expandedDirs],
+    });
+  }
+
+  onMount(() => {
+    void (async () => {
+      try {
+        const prefs = await loadUserPreferences();
+        const fallback = await invoke<string>("get_default_browse_root");
+        let start = prefs.browseRoot?.trim() || fallback;
+
+        try {
+          await invoke("list_browse_directory", { path: start });
+        } catch {
+          start = fallback;
+        }
+
+        rootPath = start;
+        const savedExpanded = prefs.expandedDirs?.filter((dir) => isUnderRoot(dir, start)) ?? [];
+        expandedDirs = new Set([start, ...savedExpanded]);
+        await reloadExpandedTree();
+      } catch (error) {
+        errorMessage = `Could not open file browser: ${String(error)}`;
+      }
+    })();
   });
 
   function parentDir(path: string): string | null {
@@ -245,9 +271,11 @@
       const next = new Set(expandedDirs);
       next.delete(path);
       expandedDirs = next;
+      persistBrowseState();
       return;
     }
     await ensureExpanded(path, true);
+    persistBrowseState();
   }
 
   function isFastaPath(path: string) {
@@ -333,6 +361,7 @@
     rootPath = nextRoot;
     expandedDirs = filterExpandedForRoot(dirsToExpand, nextRoot);
     await reloadExpandedTree();
+    persistBrowseState();
     await tick();
 
     const target = paths[0];
@@ -365,6 +394,7 @@
     focusedPath = null;
     renamePath = null;
     await reloadExpandedTree();
+    persistBrowseState();
   }
 
   async function goUp() {
@@ -377,6 +407,7 @@
     focusedPath = null;
     renamePath = null;
     await reloadExpandedTree();
+    persistBrowseState();
   }
 
   async function setRootFromFolder(path: string) {
@@ -386,6 +417,7 @@
     focusedPath = path;
     renamePath = null;
     await reloadExpandedTree();
+    persistBrowseState();
   }
 
   function findEntry(path: string): DirEntry | undefined {
@@ -741,7 +773,17 @@
                       }
                     }}
                   >
-                    <span class="icon">{entry.isDir ? "📁" : "📄"}</span>
+                    {#if entry.isDir}
+                      <span class="icon folder-icon" aria-hidden="true">📁</span>
+                    {:else}
+                      <img
+                        class="icon file-icon"
+                        src="/branding/logo-mark.svg"
+                        alt=""
+                        width="14"
+                        height="14"
+                      />
+                    {/if}
                     <span class="name-text">{entry.name}</span>
                   </button>
                 {/if}
@@ -836,7 +878,7 @@
 
   .selection-count {
     margin-left: auto;
-    color: #86efac;
+    color: var(--accent-highlight);
     font-size: 0.86rem;
     font-weight: 600;
   }
@@ -850,7 +892,7 @@
 
   .explorer-error {
     margin: 0;
-    color: #fca5a5;
+    color: var(--error);
     font-size: 0.86rem;
     white-space: pre-wrap;
   }
@@ -860,10 +902,10 @@
     flex-direction: column;
     min-height: 0;
     flex: 1;
-    border: 1px solid rgba(148, 163, 184, 0.14);
+    border: 1px solid var(--panel-border);
     border-radius: 14px;
     overflow: hidden;
-    background: rgba(2, 6, 23, 0.45);
+    background: var(--tree-bg);
   }
 
   .tree-header,
@@ -876,8 +918,8 @@
 
   .tree-header {
     padding: 8px 12px;
-    border-bottom: 1px solid rgba(148, 163, 184, 0.12);
-    color: #94a3b8;
+    border-bottom: 1px solid var(--tree-header-border);
+    color: var(--text-muted);
     font-size: 0.82rem;
     flex-shrink: 0;
   }
@@ -891,14 +933,14 @@
   }
 
   .crumb-sep {
-    color: #64748b;
+    color: var(--text-faint);
     user-select: none;
   }
 
   .crumb-btn {
     border: none;
     background: none;
-    color: #94a3b8;
+    color: var(--text-muted);
     cursor: pointer;
     padding: 2px 4px;
     border-radius: 6px;
@@ -910,12 +952,12 @@
   }
 
   .crumb-btn:hover {
-    color: #ecfeff;
-    background: rgba(51, 65, 85, 0.45);
+    color: var(--menu-active-text);
+    background: var(--menu-hover-bg);
   }
 
   .crumb-btn.current {
-    color: #e2e8f0;
+    color: var(--text-primary);
     font-weight: 600;
   }
 
@@ -939,17 +981,17 @@
   }
 
   .tree-row.focused {
-    background: rgba(34, 211, 238, 0.08);
+    background: var(--tree-focus);
   }
 
   .tree-row:hover {
-    background: rgba(51, 65, 85, 0.35);
+    background: var(--tree-hover);
   }
 
   .tree-empty {
     margin: 0;
     padding: 18px 14px;
-    color: #94a3b8;
+    color: var(--text-muted);
     font-size: 0.9rem;
   }
 
@@ -967,7 +1009,7 @@
     width: 30px;
     height: 30px;
     border-radius: 6px;
-    color: #cbd5e1;
+    color: var(--text-menu);
     font-size: 1.05rem;
     line-height: 1;
   }
@@ -975,8 +1017,27 @@
   .col-check input[type="checkbox"] {
     width: 18px;
     height: 18px;
-    accent-color: #22d3ee;
+    accent-color: var(--accent-a);
     cursor: pointer;
+  }
+
+  .icon {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 16px;
+    height: 16px;
+    line-height: 1;
+  }
+
+  .folder-icon {
+    font-size: 0.95rem;
+  }
+
+  .file-icon {
+    object-fit: contain;
+    opacity: 0.92;
   }
 
   .name-btn {
@@ -1001,9 +1062,9 @@
     min-width: 180px;
     padding: 6px 8px;
     border-radius: 8px;
-    border: 1px solid rgba(103, 232, 249, 0.35);
-    background: rgba(15, 23, 42, 0.95);
-    color: #e8eef8;
+    border: 1px solid var(--chip-active-border);
+    background: var(--input-bg);
+    color: var(--text-primary);
   }
 
   .context-menu {
@@ -1012,8 +1073,8 @@
     min-width: 190px;
     padding: 6px;
     border-radius: 10px;
-    background: rgba(15, 23, 42, 0.98);
-    border: 1px solid rgba(148, 163, 184, 0.18);
+    background: var(--dropdown-bg);
+    border: 1px solid var(--dropdown-border);
     box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
   }
 
@@ -1023,17 +1084,17 @@
     text-align: left;
     padding: 8px 10px;
     border-radius: 8px;
-    color: #e2e8f0;
+    color: var(--text-primary);
     font-size: 0.86rem;
   }
 
   .context-item:hover:not(:disabled) {
-    background: rgba(34, 211, 238, 0.12);
-    color: #ecfeff;
+    background: var(--dropdown-hover-bg);
+    color: var(--menu-active-text);
   }
 
   .context-item.danger {
-    color: #fecaca;
+    color: var(--status-error-text);
   }
 
   .context-item:disabled {
@@ -1044,9 +1105,9 @@
   .ghost {
     padding: 8px 12px;
     border-radius: 10px;
-    background: rgba(30, 41, 59, 0.9);
-    color: #e2e8f0;
-    border: 1px solid rgba(148, 163, 184, 0.16);
+    background: var(--chip-bg);
+    color: var(--text-primary);
+    border: 1px solid var(--chip-border);
     font-weight: 600;
   }
 

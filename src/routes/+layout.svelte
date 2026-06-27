@@ -1,5 +1,13 @@
 <script lang="ts">
+  import { onMount } from "svelte";
+  import { applyTheme } from "$lib/theme.svelte";
+  import "$lib/theme.css";
+
   let { children } = $props();
+
+  onMount(() => {
+    applyTheme();
+  });
 </script>
 
 {@render children()}
@@ -13,8 +21,8 @@
     margin: 0;
     height: 100%;
     overflow: hidden;
-    background: #070b14;
-    color: #e8eef8;
+    background: var(--bg-base);
+    color: var(--text-primary);
     font-family: "DM Sans", system-ui, sans-serif;
     -webkit-font-smoothing: antialiased;
   }
@@ -24,12 +32,12 @@
   }
 
   :global(::selection) {
-    background: rgba(56, 189, 248, 0.35);
+    background: var(--selection-bg);
   }
 
   :global(*) {
     scrollbar-width: thin;
-    scrollbar-color: rgba(71, 85, 105, 0.9) rgba(15, 23, 42, 0.95);
+    scrollbar-color: rgba(71, 85, 105, 0.9) var(--scrollbar-track);
   }
 
   :global(*::-webkit-scrollbar) {
@@ -38,17 +46,17 @@
   }
 
   :global(*::-webkit-scrollbar-track) {
-    background: rgba(15, 23, 42, 0.95);
+    background: var(--scrollbar-track);
     border-radius: 999px;
   }
 
   :global(*::-webkit-scrollbar-thumb) {
-    background: linear-gradient(180deg, rgba(71, 85, 105, 0.95), rgba(51, 65, 85, 0.95));
-    border: 2px solid rgba(15, 23, 42, 0.95);
+    background: var(--scrollbar-thumb);
+    border: 2px solid var(--scrollbar-track);
     border-radius: 999px;
   }
 
   :global(*::-webkit-scrollbar-thumb:hover) {
-    background: linear-gradient(180deg, rgba(100, 116, 139, 0.95), rgba(71, 85, 105, 0.95));
+    background: var(--scrollbar-thumb-hover);
   }
 </style>
