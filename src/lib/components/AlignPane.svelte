@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { cancelJob, runAlignment as invokeAlignment, runPreflightCheck } from "$lib/api";
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { open, save } from "@tauri-apps/plugin-dialog";
@@ -48,7 +49,10 @@
   let sortOutput = $state(true);
   let secondaryAlignments = $state(true);
   let indexOutput = $state(true);
+  let filterUnmapped = $state(false);
+  let markDuplicates = $state(false);
   let isFetching = $state(false);
+  let currentJobId = $state<string | null>(null);
   let isSaving = $state(false);
   let isAligning = $state(false);
   let lastSummary = $state<AlignSummary | null>(null);
@@ -189,25 +193,38 @@
       onLog("Download or load a reference genome first.", "error");
       return;
     }
+    const preflight = await runPreflightCheck({
+      mode: "align",
+      inputPaths: readPaths,
+      outputDir: outputDir.trim(),
+      referencePath: loadedReference ? selectedReferenceId : null,
+    });
+    if (!preflight.ok) {
+      onLog(preflight.issues.map((issue) => issue.message).join("\n"), "error");
+      return;
+    }
+
     isAligning = true;
+    currentJobId = `align-${Date.now()}`;
     onBusyChange?.(true);
     onLog(`Aligning ${readPaths.length} read file(s) with minimap2…`);
 
     try {
-      const summary = await invoke<AlignSummary>("run_alignment", {
-        request: {
-          readPaths,
-          outputDir: outputDir.trim(),
-          outputStem: outputStem.trim() || "aligned_reads",
-          outputFormat,
-          compress,
-          referenceId: selectedReferenceId,
-          preset,
-          indexReference,
-          sortOutput,
-          secondaryAlignments,
-          indexOutput,
-        },
+      const summary = await invokeAlignment({
+        readPaths,
+        outputDir: outputDir.trim(),
+        outputStem: outputStem.trim() || "aligned_reads",
+        outputFormat,
+        compress,
+        referenceId: selectedReferenceId,
+        preset,
+        indexReference,
+        sortOutput,
+        secondaryAlignments,
+        indexOutput,
+        filterUnmapped,
+        markDuplicates,
+        jobId: currentJobId,
       });
       lastSummary = summary;
       onLog(
@@ -220,8 +237,15 @@
       onLog(`Alignment error: ${String(error)}`, "error");
     } finally {
       isAligning = false;
+      currentJobId = null;
       onBusyChange?.(false);
     }
+  }
+
+  async function cancelAlignment() {
+    if (!currentJobId) return;
+    await cancelJob(currentJobId);
+    onLog("Alignment cancelled.", "warn");
   }
 </script>
 
@@ -365,6 +389,8 @@
         <option value="sr">Short reads (-x sr)</option>
         <option value="ont">Nanopore (-x map-ont)</option>
         <option value="hifi">PacBio HiFi (-x map-hifi)</option>
+        <option value="splice">RNA-seq / splice (-x splice)</option>
+        <option value="asm5">Assembly (-x asm5)</option>
       </select>
     </label>
     <label class="toggle">
@@ -389,6 +415,14 @@
         <HelpTip text="Runs samtools index after BAM/CRAM output so IGV can load the file without building an index itself." />
       </label>
     {/if}
+    <label class="toggle">
+      <input type="checkbox" bind:checked={filterUnmapped} disabled={disabled || isAligning} />
+      <span>Remove unmapped reads (samtools view -F 4)</span>
+    </label>
+    <label class="toggle">
+      <input type="checkbox" bind:checked={markDuplicates} disabled={disabled || isAligning || outputFormat === "sam"} />
+      <span>Mark/remove duplicates (samtools markdup)</span>
+    </label>
   </div>
 
   {#if !minimap2Available || !samtoolsAvailable}
@@ -398,13 +432,18 @@
     </p>
   {/if}
 
-  <button
-    class="primary"
-    onclick={runAlignment}
-    disabled={disabled || isAligning || readPaths.length === 0 || !loadedReference || !minimap2Available || !samtoolsAvailable}
-  >
-    {isAligning ? "Aligning…" : "Run alignment"}
-  </button>
+  <div class="row actions">
+    <button
+      class="primary"
+      onclick={runAlignment}
+      disabled={disabled || isAligning || readPaths.length === 0 || !loadedReference || !minimap2Available || !samtoolsAvailable}
+    >
+      {isAligning ? "Aligning…" : "Run alignment"}
+    </button>
+    {#if isAligning}
+      <button class="ghost" onclick={cancelAlignment}>Cancel</button>
+    {/if}
+  </div>
 
   {#if lastSummary}
     <div class="success">

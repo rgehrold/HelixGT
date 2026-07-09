@@ -2,23 +2,26 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
-  import { open } from "@tauri-apps/plugin-dialog";
+
   import { onMount } from "svelte";
   import AlignPane from "$lib/components/AlignPane.svelte";
+  import ConvertPane from "$lib/components/ConvertPane.svelte";
   import FileExplorer from "$lib/components/FileExplorer.svelte";
   import MergePane from "$lib/components/MergePane.svelte";
   import MenuBar from "$lib/components/MenuBar.svelte";
-  import { inferLogLevel } from "$lib/log";
-  import HelpTip from "$lib/components/HelpTip.svelte";
+  import { appendLog } from "$lib/log";
+  import { getSupportedFormats } from "$lib/api";
   import { clampFilesPaneWidth } from "$lib/layout";
   import {
     defaultFilesPaneWidth,
     loadUserPreferences,
+    outputDirForMode,
     patchUserPreferences,
+    rememberMode,
+    rememberOutputDir,
     saveUserPreferencesNow,
   } from "$lib/userPreferences";
   import type {
-    ConvertProgress,
     ConvertSummary,
     FormatInfo,
     LogEntry,
@@ -38,11 +41,9 @@
   let samtoolsAvailable = $state(false);
   let isConverting = $state(false);
   let isDragging = $state(false);
-  let progress = $state<ConvertProgress | null>(null);
   let logs = $state<LogEntry[]>([]);
   let toolLogs = $state<LogEntry[]>([]);
   let logTab = $state<"activity" | "tools">("activity");
-  let lastSummary = $state<ConvertSummary | null>(null);
   let fileExplorer = $state<{
     revealPaths: (paths: string[]) => Promise<void>;
     refreshTree: () => Promise<void>;
@@ -70,12 +71,13 @@
 
   const showSetAsReference = $derived(activeMode === "align" || needsReferenceForConvert);
 
-  const categoryLabels: Record<string, string> = {
-    sequence: "Sequence",
-    alignment: "Alignment",
-    annotation: "Annotation",
-    variants: "Variants",
-  };
+  $effect(() => {
+    rememberMode(activeMode);
+  });
+
+  $effect(() => {
+    if (outputDir.trim()) rememberOutputDir(activeMode, outputDir);
+  });
 
   $effect(() => {
     logs;
@@ -98,6 +100,9 @@
         if (typeof prefs.filesPaneWidth === "number") {
           filesPaneWidth = prefs.filesPaneWidth;
         }
+        if (prefs.activeMode) activeMode = prefs.activeMode;
+        if (prefs.outputFormat) outputFormat = prefs.outputFormat;
+        outputDir = outputDirForMode(prefs, activeMode);
         queueMicrotask(() => syncPaneWidthToWorkspace(document.querySelector(".workspace")));
       } catch (error) {
         pushLog(`Could not load saved layout: ${String(error)}`, "warn");
@@ -105,7 +110,7 @@
 
       pushLog("Ready.");
       try {
-        formats = await invoke<FormatInfo[]>("get_supported_formats");
+        formats = await getSupportedFormats();
       } catch (error) {
         pushLog(`Could not load output formats: ${String(error)}`, "error");
       }
@@ -116,17 +121,6 @@
         const { tool, stream, line } = event.payload;
         pushToolLog(`[${tool} ${stream}] ${line}`);
       });
-      await listen<ConvertProgress>("convert-progress", (event) => {
-        progress = event.payload;
-        logs = [
-          ...logs,
-          {
-            level: "info" as const,
-            message: `[${event.payload.current}/${event.payload.total}] ${event.payload.fileName}`,
-          },
-        ];
-      });
-
       await getCurrentWebview().onDragDropEvent((event) => {
         if (event.payload.type === "drop") {
           isDragging = false;
@@ -145,11 +139,11 @@
   });
 
   function pushLog(message: string, level?: LogLevel) {
-    logs = [...logs, { level: level ?? inferLogLevel(message), message }];
+    logs = appendLog(logs, message, level);
   }
 
   function pushToolLog(message: string, level?: LogLevel) {
-    toolLogs = [...toolLogs, { level: level ?? inferLogLevel(message), message }];
+    toolLogs = appendLog(toolLogs, message, level);
   }
 
   function alignmentIndexPath(outputPath: string): string | null {
@@ -205,7 +199,20 @@
 
   async function addPaths(paths: string[]) {
     if (paths.length === 0) return;
-    const valid = await invoke<string[]>("validate_input_paths", { paths });
+    const expanded: string[] = [];
+    for (const path of paths) {
+      try {
+        const children = await invoke<string[]>("collect_compatible_files_under", { path });
+        if (children.length > 0) {
+          expanded.push(...children);
+          continue;
+        }
+      } catch {
+        // not a folder or unreadable — treat as file
+      }
+      expanded.push(path);
+    }
+    const valid = await invoke<string[]>("validate_input_paths", { paths: expanded });
     const merged = new Set([...selectedPaths, ...valid]);
     selectedPaths = [...merged].sort();
     if (valid.length < paths.length) {
@@ -241,107 +248,15 @@
     window.addEventListener("mouseup", onUp);
   }
 
-  async function browseOutputDir() {
-    const picked = await open({
-      directory: true,
-      multiple: false,
-      title: "Choose output folder",
-    });
-    if (picked) outputDir = String(picked);
-  }
-
-  async function browseReferenceFasta() {
-    const picked = await open({
-      directory: false,
-      multiple: false,
-      title: "Choose reference FASTA for CRAM",
-      filters: [{ name: "FASTA", extensions: ["fasta", "fa", "fna", "gz"] }],
-    });
-    if (picked) referencePath = String(picked);
-  }
-
-  const alignmentInputPaths = $derived(
-    selectedPaths.filter((path) => /\.(sam|bam|cram)(\.gz)?$/i.test(path)),
-  );
-
   function onDragOver(event: DragEvent) {
     event.preventDefault();
   }
 
-  async function startConversion() {
-    lastSummary = null;
-
-    if (selectedPaths.length === 0) {
-      pushLog("Select at least one compatible input file in the browser.", "error");
-      return;
-    }
-    if (!outputDir.trim()) {
-      pushLog("Choose an output folder.", "error");
-      return;
-    }
-
-    const inputPaths =
-      outputFormat === "cram"
-        ? alignmentInputPaths
-        : selectedPaths;
-
-    if (needsReferenceForConvert) {
-      if (!referencePath.trim()) {
-        pushLog("Choose a reference FASTA for CRAM conversion or decoding.", "error");
-        return;
-      }
-      if (!samtoolsAvailable) {
-        pushLog("CRAM conversion requires samtools on PATH or in src-tauri/binaries/.", "error");
-        return;
-      }
-    }
-
-    if (outputFormat === "cram") {
-      if (inputPaths.length === 0) {
-        pushLog("Select at least one SAM or BAM file to convert to CRAM.", "error");
-        return;
-      }
-      if (inputPaths.length < selectedPaths.length) {
-        pushLog(
-          `Converting ${inputPaths.length} alignment file(s); skipped ${selectedPaths.length - inputPaths.length} non-alignment file(s).`,
-          "warn",
-        );
-      }
-    } else if (inputPaths.length === 0) {
-      pushLog("Select at least one compatible input file in the browser.", "error");
-      return;
-    }
-
-    isConverting = true;
-    progress = null;
-    pushLog("Starting batch conversion…");
-
-    try {
-      const summary = await invoke<ConvertSummary>("run_conversion", {
-        request: {
-          inputPaths,
-          outputDir: outputDir.trim(),
-          outputFormat,
-          compress,
-          prefix: prefix.trim() || null,
-          referencePath: needsReferenceForConvert ? referencePath.trim() : null,
-        },
-      });
-      lastSummary = summary;
-      pushLog(
-        `Done — ${summary.files.length} file(s), ${summary.totalRecords.toLocaleString()} records.`,
-      );
-      await fileExplorer?.refreshTree();
-      const outputPaths = collectOutputPaths(summary.files.map((file) => file.outputPath));
-      if (outputPaths.length > 0) {
-        await fileExplorer?.revealPaths(outputPaths);
-      }
-    } catch (error) {
-      pushLog(`Error: ${String(error)}`, "error");
-    } finally {
-      isConverting = false;
-      progress = null;
-    }
+  function switchMode(mode: ToolMode) {
+    activeMode = mode;
+    void loadUserPreferences().then((prefs) => {
+      outputDir = outputDirForMode(prefs, mode);
+    });
   }
 </script>
 
@@ -384,13 +299,13 @@
       <div class="panel-head">
         <h2>Tools</h2>
         <div class="mode-tabs">
-          <button class="mode-tab" class:active={activeMode === "convert"} onclick={() => (activeMode = "convert")}>
+          <button class="mode-tab" class:active={activeMode === "convert"} onclick={() => switchMode("convert")}>
             Convert
           </button>
-          <button class="mode-tab" class:active={activeMode === "merge"} onclick={() => (activeMode = "merge")}>
+          <button class="mode-tab" class:active={activeMode === "merge"} onclick={() => switchMode("merge")}>
             Merge
           </button>
-          <button class="mode-tab" class:active={activeMode === "align"} onclick={() => (activeMode = "align")}>
+          <button class="mode-tab" class:active={activeMode === "align"} onclick={() => switchMode("align")}>
             Align
           </button>
         </div>
@@ -398,89 +313,29 @@
 
       <div class="settings-scroll">
       {#if activeMode === "convert"}
-      <label class="field">
-        <span>Output format</span>
-        <div class="format-groups">
-          {#each [...new Set(formats.map((format) => format.category))] as category}
-            <div class="format-group">
-              <p>{categoryLabels[category] ?? category}</p>
-              <div class="pills">
-                {#each formats.filter((format) => format.category === category) as format}
-                  <button
-                    class="pill"
-                    class:active={outputFormat === format.id}
-                    onclick={() => (outputFormat = format.id)}
-                    disabled={isBusy}
-                  >
-                    {format.label}
-                  </button>
-                {/each}
-              </div>
-            </div>
-          {/each}
-        </div>
-      </label>
-
-      <label class="field">
-        <span>Output folder</span>
-        <div class="row">
-          <input bind:value={outputDir} placeholder="C:\path\to\output" disabled={isConverting} />
-          <button class="ghost" onclick={browseOutputDir} disabled={isConverting}>Choose</button>
-        </div>
-      </label>
-
-      <label class="field">
-        <span>Filename prefix (optional)</span>
-        <input bind:value={prefix} placeholder="run42_" disabled={isConverting} />
-      </label>
-
-      <label class="toggle">
-        <input type="checkbox" bind:checked={compress} disabled={isConverting || outputFormat === "cram"} />
-        <span>Gzip compress text outputs (.gz)</span>
-        <HelpTip text="Applies to text formats such as FASTA, FASTQ, SAM, GFF, and VCF. Binary BAM/CRAM are always compressed internally." />
-      </label>
-
-      {#if needsReferenceForConvert}
-        <label class="field">
-          <span class="label-with-help">
-            <span>Reference FASTA (required for CRAM)</span>
-            <HelpTip text="CRAM stores differences against a reference FASTA. Required when converting to or from CRAM. The app also looks for a matching FASTA next to each CRAM file. Right-click a FASTA and choose Set as reference." />
-          </span>
-          <div class="row">
-            <input
-              bind:value={referencePath}
-              placeholder="C:\path\to\reference.fasta"
-              disabled={isConverting}
-            />
-            <button class="ghost" onclick={browseReferenceFasta} disabled={isConverting}>Choose</button>
-          </div>
-          <p class="subtle">
-            {#if outputFormat === "cram"}
-              Applies to all selected SAM/BAM files ({alignmentInputPaths.length} of {selectedPaths.length} selected).
-            {:else if selectedHasCram}
-              Used to decode {selectedPaths.filter((path) => /\.cram$/i.test(path)).length} selected CRAM file(s).
-            {/if}
-          </p>
-        </label>
-      {/if}
-
-      <button class="primary" onclick={startConversion} disabled={isConverting}>
-        {isConverting ? "Converting…" : "Run conversion"}
-      </button>
-
-      {#if progress}
-        <div class="progress-wrap">
-          <div class="progress-bar" style={`width: ${(progress.current / progress.total) * 100}%`}></div>
-        </div>
-        <p class="progress-label">{progress.current} / {progress.total} — {progress.fileName}</p>
-      {/if}
-
-      {#if lastSummary}
-        <div class="success">
-          <strong>Conversion complete</strong>
-          <p>{lastSummary.files.length} files · {lastSummary.totalRecords.toLocaleString()} records</p>
-        </div>
-      {/if}
+        <ConvertPane
+          {formats}
+          {selectedPaths}
+          {outputDir}
+          bind:compress
+          bind:prefix
+          bind:referencePath
+          outputFormat={outputFormat}
+          disabled={isBusy}
+          {samtoolsAvailable}
+          onOutputFormatChange={(value) => {
+            outputFormat = value;
+            patchUserPreferences({ outputFormat: value });
+          }}
+          onOutputDirChange={(value) => (outputDir = value)}
+          onLog={pushLog}
+          onBusyChange={(busy) => (isConverting = busy)}
+          onComplete={async (summary) => {
+            await fileExplorer?.refreshTree();
+            const outputPaths = collectOutputPaths(summary.files.map((file) => file.outputPath));
+            if (outputPaths.length > 0) await fileExplorer?.revealPaths(outputPaths);
+          }}
+        />
       {:else if activeMode === "merge"}
         <MergePane
           {selectedPaths}

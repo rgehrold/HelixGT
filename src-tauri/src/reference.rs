@@ -7,12 +7,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use converter_core::{
-    find_reference, is_gzip_bytes, is_gzip_path, list_references, validate_reference_file,
-    EnsemblReference,
+    ensure_reference_index, find_reference, is_gzip_bytes, is_gzip_path, list_references,
+    validate_reference_file, EnsemblReference,
 };
 use flate2::read::MultiGzDecoder;
 use reqwest::blocking::Client;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
 #[derive(Debug, Clone, Serialize)]
@@ -57,6 +57,16 @@ pub struct ReferenceDownloadProgress {
     pub percent: Option<f32>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedReferenceManifestEntry {
+    id: String,
+    label: String,
+    cache_path: String,
+    gzipped: bool,
+    sequence_bytes: usize,
+}
+
 struct CachedReference {
     label: String,
     cache_path: PathBuf,
@@ -67,19 +77,75 @@ struct CachedReference {
 pub struct ReferenceStore {
     client: Client,
     entries: Mutex<HashMap<String, CachedReference>>,
+    cache_root: PathBuf,
 }
 
 impl ReferenceStore {
-    pub fn new() -> Self {
+    pub fn new(cache_root: PathBuf) -> Self {
+        let _ = fs::create_dir_all(&cache_root);
+        let mut entries = HashMap::new();
+        Self::load_manifest(&cache_root, &mut entries);
         Self {
             client: Client::builder()
-                .user_agent("HelixGT/0.1")
+                .user_agent("HelixGT/0.2")
                 .timeout(Duration::from_secs(3600))
                 .connect_timeout(Duration::from_secs(60))
                 .build()
                 .expect("failed to build HTTP client"),
-            entries: Mutex::new(HashMap::new()),
+            entries: Mutex::new(entries),
+            cache_root,
         }
+    }
+
+    fn manifest_path(cache_root: &Path) -> PathBuf {
+        cache_root.join("manifest.json")
+    }
+
+    fn load_manifest(cache_root: &Path, entries: &mut HashMap<String, CachedReference>) {
+        let path = Self::manifest_path(cache_root);
+        let raw = match fs::read_to_string(&path) {
+            Ok(value) => value,
+            Err(_) => return,
+        };
+        let manifest: Vec<CachedReferenceManifestEntry> =
+            match serde_json::from_str(&raw) {
+                Ok(value) => value,
+                Err(_) => return,
+            };
+        for item in manifest {
+            let cache_path = PathBuf::from(&item.cache_path);
+            if !cache_path.is_file() {
+                continue;
+            }
+            entries.insert(
+                item.id,
+                CachedReference {
+                    label: item.label,
+                    cache_path,
+                    gzipped: item.gzipped,
+                    sequence_bytes: item.sequence_bytes,
+                },
+            );
+        }
+    }
+
+    fn persist_manifest(&self) -> Result<(), String> {
+        let entries = self.entries.lock().expect("reference cache lock poisoned");
+        let manifest: Vec<CachedReferenceManifestEntry> = entries
+            .iter()
+            .map(|(id, entry)| CachedReferenceManifestEntry {
+                id: id.clone(),
+                label: entry.label.clone(),
+                cache_path: entry.cache_path.display().to_string(),
+                gzipped: entry.gzipped,
+                sequence_bytes: entry.sequence_bytes,
+            })
+            .collect();
+        let json = serde_json::to_string_pretty(&manifest)
+            .map_err(|error| format!("failed to serialize reference manifest: {error}"))?;
+        fs::write(Self::manifest_path(&self.cache_root), json)
+            .map_err(|error| format!("failed to write reference manifest: {error}"))?;
+        Ok(())
     }
 
     pub fn list_catalog() -> Vec<EnsemblReferenceInfo> {
@@ -117,7 +183,31 @@ impl ReferenceStore {
         }
 
         let reference = find_reference(id).ok_or_else(|| format!("unknown reference '{id}'"))?;
-        let cache_path = Self::cache_file_path(id, &reference);
+        let cache_path = self.cache_file_path(id, &reference);
+        if cache_path.is_file() {
+            let gzipped = is_gzip_file(&cache_path);
+            if let Ok(sequence_bytes) = validate_reference_file(&cache_path, gzipped) {
+                let mut entries = self.entries.lock().expect("reference cache lock poisoned");
+                entries.insert(
+                    id.to_string(),
+                    CachedReference {
+                        label: reference.label.clone(),
+                        cache_path: cache_path.clone(),
+                        gzipped,
+                        sequence_bytes,
+                    },
+                );
+                let _ = self.persist_manifest();
+                return Ok(ReferenceFetchResult {
+                    id: id.to_string(),
+                    label: reference.label,
+                    size_bytes: cache_path.metadata().map(|m| m.len() as usize).unwrap_or(0),
+                    sequence_bytes,
+                    gzipped,
+                    cached: true,
+                });
+            }
+        }
         fs::create_dir_all(
             cache_path
                 .parent()
@@ -150,8 +240,14 @@ impl ReferenceStore {
                 sequence_bytes,
             },
         );
+        self.persist_manifest()?;
 
         Ok(result)
+    }
+
+    pub fn ensure_index(&self, samtools: &Path, id: &str) -> Result<(), String> {
+        let path = self.reference_path(id)?;
+        ensure_reference_index(samtools, &path).map_err(|error| format!("{error:#}"))
     }
 
     pub fn load_local_file(&self, id: &str, path: &str) -> Result<ReferenceFetchResult, String> {
@@ -184,6 +280,7 @@ impl ReferenceStore {
                 sequence_bytes,
             },
         );
+        self.persist_manifest()?;
 
         Ok(result)
     }
@@ -249,19 +346,20 @@ impl ReferenceStore {
         match id {
             Some(value) => {
                 if let Some(entry) = entries.remove(value) {
-                    if entry.cache_path.starts_with(Self::cache_root()) {
+                    if entry.cache_path.starts_with(&self.cache_root) {
                         let _ = fs::remove_file(entry.cache_path);
                     }
                 }
             }
             None => {
                 for (_, entry) in entries.drain() {
-                    if entry.cache_path.starts_with(Self::cache_root()) {
+                    if entry.cache_path.starts_with(&self.cache_root) {
                         let _ = fs::remove_file(entry.cache_path);
                     }
                 }
             }
         }
+        let _ = self.persist_manifest();
     }
 
     fn result_from_entry(id: &str, entry: &CachedReference, cached: bool) -> ReferenceFetchResult {
@@ -275,17 +373,13 @@ impl ReferenceStore {
         }
     }
 
-    fn cache_root() -> PathBuf {
-        std::env::temp_dir().join("ugt_reference_cache")
-    }
-
-    fn cache_file_path(id: &str, reference: &EnsemblReference) -> PathBuf {
+    fn cache_file_path(&self, id: &str, reference: &EnsemblReference) -> PathBuf {
         let file_name = reference
             .url
             .rsplit('/')
             .next()
             .unwrap_or("reference.fna.gz");
-        Self::cache_root().join(format!("{id}_{file_name}"))
+        self.cache_root.join(format!("{id}_{file_name}"))
     }
 
     fn download_streaming(

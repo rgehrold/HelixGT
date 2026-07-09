@@ -19,15 +19,14 @@ pub fn convert_genbank(
         (FileFormat::GenBank, FileFormat::GenBank) => copy_genbank(input_path, output_path, options),
         (FileFormat::GenBank, FileFormat::Fasta) => genbank_to_fasta(input_path, output_path, options),
         (FileFormat::GenBank, FileFormat::Fastq) => {
-            let temp = std::env::temp_dir().join(format!("ugt_fasta_{}.fasta", std::process::id()));
+            let temp = crate::tools::helixgt_temp_file("genbank", "fasta");
             genbank_to_fasta(
                 input_path,
                 &temp,
                 &ConvertOptions {
                     output_format: FileFormat::Fasta,
                     compress: false,
-                    prefix: String::new(),
-                    reference_path: None,
+                    ..Default::default()
                 },
             )?;
             let count = super::sequence::convert_sequence(
@@ -37,8 +36,7 @@ pub fn convert_genbank(
                 &ConvertOptions {
                     output_format: FileFormat::Fastq,
                     compress: options.compress,
-                    prefix: String::new(),
-                    reference_path: None,
+                    ..Default::default()
                 },
             )?;
             let _ = std::fs::remove_file(temp);
@@ -60,7 +58,7 @@ pub fn sequence_to_genbank(
     match input_format {
         FileFormat::Fasta => fasta_to_genbank(input_path, output_path, options),
         FileFormat::Fastq => {
-            let temp = std::env::temp_dir().join(format!("ugt_fasta_{}.fasta", std::process::id()));
+            let temp = crate::tools::helixgt_temp_file("genbank", "fasta");
             super::sequence::convert_sequence(
                 input_path,
                 &temp,
@@ -68,8 +66,7 @@ pub fn sequence_to_genbank(
                 &ConvertOptions {
                     output_format: FileFormat::Fasta,
                     compress: false,
-                    prefix: String::new(),
-                    reference_path: None,
+                    ..Default::default()
                 },
             )?;
             let count = fasta_to_genbank(&temp, output_path, options)?;

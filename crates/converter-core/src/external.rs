@@ -6,6 +6,8 @@ use std::thread;
 
 use anyhow::{Context, Result};
 
+use crate::tools::ToolPaths;
+
 pub trait ToolLogSink: Send + Sync {
     fn log_line(&self, tool: &str, stream: &str, line: &str);
 }
@@ -291,7 +293,7 @@ pub fn samtools_view_to_cram(
     samtools_flagstat(samtools, output_path).map(|(_, total)| total)
 }
 
-pub fn index_alignment_output_if_needed(output_path: &Path) -> Result<()> {
+pub fn index_alignment_output_if_needed(output_path: &Path, tool_paths: &ToolPaths) -> Result<()> {
     let extension = output_path
         .extension()
         .and_then(|value| value.to_str())
@@ -300,8 +302,47 @@ pub fn index_alignment_output_if_needed(output_path: &Path) -> Result<()> {
     if extension != "bam" && extension != "cram" {
         return Ok(());
     }
-    let samtools = resolve_samtools_path(&[]).context(
+    let samtools = tool_paths.resolve_samtools().context(
         "samtools is required to index BAM/CRAM output. Place samtools.exe in src-tauri/binaries/ or add it to PATH.",
     )?;
     samtools_index(&samtools, output_path)
+}
+
+pub fn samtools_merge(
+    samtools: &Path,
+    output_path: &Path,
+    input_paths: &[PathBuf],
+    reference_path: Option<&Path>,
+) -> Result<()> {
+    if input_paths.is_empty() {
+        anyhow::bail!("samtools merge requires at least one input file");
+    }
+
+    let output = output_path
+        .to_str()
+        .context("merge output path is not valid UTF-8")?;
+    let mut command = new_command(samtools);
+    command.arg("merge").arg("-f").arg("-o").arg(output);
+    if let Some(reference) = reference_path {
+        if output_path.extension().and_then(|value| value.to_str()) == Some("cram") {
+            command.args(["-T", reference.to_str().context("invalid reference path")?]);
+        }
+    }
+    for input in input_paths {
+        command.arg(input);
+    }
+    run_command(command, "samtools merge")
+}
+
+pub fn samtools_faidx(samtools: &Path, reference_path: &Path) -> Result<()> {
+    let index_path = reference_path.with_extension("fai");
+    if index_path.is_file() {
+        return Ok(());
+    }
+    let reference = reference_path
+        .to_str()
+        .context("reference path is not valid UTF-8")?;
+    let mut command = new_command(samtools);
+    command.args(["faidx", reference]);
+    run_command(command, "samtools faidx")
 }

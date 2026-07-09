@@ -5,16 +5,18 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use flate2::read::MultiGzDecoder;
 
-use noodles::bam;
-use noodles::cram;
 use noodles::fasta;
 use noodles::fastq;
 use noodles::sam;
 
 
 
+use crate::cancel::CancelToken;
 use crate::convert::{finish_gzip_writer, open_buf_reader, open_buf_writer, open_text_writer};
+use crate::external::{samtools_merge, samtools_view_count};
 use crate::format::{infer_format, is_gzipped, FileFormat};
+use crate::preflight::check_cancel;
+use crate::tools::ToolPaths;
 
 #[derive(Debug, Clone)]
 pub struct MergeValidation {
@@ -36,6 +38,9 @@ pub struct MergeSuggestion {
 pub struct MergeOptions {
     pub output_name: String,
     pub compress: Option<bool>,
+    pub tool_paths: ToolPaths,
+    pub reference_path: Option<PathBuf>,
+    pub cancel: Option<CancelToken>,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +161,7 @@ pub fn merge_files(
     input_paths: &[PathBuf],
     output_dir: &Path,
     options: &MergeOptions,
+    mut on_progress: Option<&mut dyn FnMut(u64, &str)>,
 ) -> Result<MergeResult> {
     let validation = validate_merge_inputs(input_paths);
     if !validation.is_valid {
@@ -173,14 +179,22 @@ pub fn merge_files(
         input_paths.iter().all(|path| is_gzipped(path.as_path()))
     });
 
+    check_cancel(options.cancel.as_ref())?;
+
     let records = match format {
-        FileFormat::Fasta => merge_fasta(input_paths, &output_path, compress)?,
-        FileFormat::Fastq => merge_fastq(input_paths, &output_path, compress)?,
-        FileFormat::Sam => merge_sam(input_paths, &output_path, compress)?,
-        FileFormat::Bam => merge_bam(input_paths, &output_path)?,
-        FileFormat::Cram => merge_cram(input_paths, &output_path)?,
+        FileFormat::Fasta => {
+            merge_fasta(input_paths, &output_path, compress, options, &mut on_progress)?
+        }
+        FileFormat::Fastq => {
+            merge_fastq(input_paths, &output_path, compress, options, &mut on_progress)?
+        }
+        FileFormat::Sam => {
+            merge_sam(input_paths, &output_path, compress, options, &mut on_progress)?
+        }
+        FileFormat::Bam => merge_bam_samtools(input_paths, &output_path, options, &mut on_progress)?,
+        FileFormat::Cram => merge_cram_samtools(input_paths, &output_path, options, &mut on_progress)?,
         FileFormat::Gff | FileFormat::Bed | FileFormat::Vcf | FileFormat::GenBank => {
-            merge_text_lines(input_paths, &output_path, compress, format)?
+            merge_text_lines(input_paths, &output_path, compress, format, options, &mut on_progress)?
         }
     };
 
@@ -191,16 +205,34 @@ pub fn merge_files(
     })
 }
 
-fn merge_fasta(paths: &[PathBuf], output_path: &Path, compress: bool) -> Result<u64> {
+fn emit_progress(
+    on_progress: &mut Option<&mut dyn FnMut(u64, &str)>,
+    count: u64,
+    message: &str,
+) {
+    if let Some(callback) = on_progress.as_mut() {
+        callback(count, message);
+    }
+}
+
+fn merge_fasta(
+    paths: &[PathBuf],
+    output_path: &Path,
+    compress: bool,
+    options: &MergeOptions,
+    on_progress: &mut Option<&mut dyn FnMut(u64, &str)>,
+) -> Result<u64> {
     let mut writer = fasta::io::writer::Builder::default()
         .build_from_writer(open_buf_writer(output_path, compress)?);
     let mut count = 0u64;
 
     for input_path in paths {
+        check_cancel(options.cancel.as_ref())?;
         let mut reader = fasta::io::reader::Builder::default()
             .build_from_reader(open_buf_reader(input_path)?)
             .with_context(|| format!("failed to open FASTA '{}'", input_path.display()))?;
         for (index, result) in reader.records().enumerate() {
+            check_cancel(options.cancel.as_ref())?;
             let record = result.with_context(|| {
                 format!(
                     "invalid FASTA record #{} in '{}'",
@@ -216,6 +248,13 @@ fn merge_fasta(paths: &[PathBuf], output_path: &Path, compress: bool) -> Result<
                 )
             })?;
             count += 1;
+            if count % 1000 == 0 {
+                emit_progress(
+                    on_progress,
+                    count,
+                    &format!("merged {count} FASTA records"),
+                );
+            }
         }
     }
 
@@ -223,13 +262,21 @@ fn merge_fasta(paths: &[PathBuf], output_path: &Path, compress: bool) -> Result<
     Ok(count)
 }
 
-fn merge_fastq(paths: &[PathBuf], output_path: &Path, compress: bool) -> Result<u64> {
+fn merge_fastq(
+    paths: &[PathBuf],
+    output_path: &Path,
+    compress: bool,
+    options: &MergeOptions,
+    on_progress: &mut Option<&mut dyn FnMut(u64, &str)>,
+) -> Result<u64> {
     let mut writer = fastq::io::Writer::new(open_buf_writer(output_path, compress)?);
     let mut count = 0u64;
 
     for input_path in paths {
+        check_cancel(options.cancel.as_ref())?;
         let mut reader = fastq::io::Reader::new(open_buf_reader(input_path)?);
         for (index, result) in reader.records().enumerate() {
+            check_cancel(options.cancel.as_ref())?;
             let record = result.with_context(|| {
                 format!(
                     "invalid FASTQ record #{} in '{}'",
@@ -245,6 +292,13 @@ fn merge_fastq(paths: &[PathBuf], output_path: &Path, compress: bool) -> Result<
                 )
             })?;
             count += 1;
+            if count % 1000 == 0 {
+                emit_progress(
+                    on_progress,
+                    count,
+                    &format!("merged {count} FASTQ records"),
+                );
+            }
         }
     }
 
@@ -252,11 +306,18 @@ fn merge_fastq(paths: &[PathBuf], output_path: &Path, compress: bool) -> Result<
     Ok(count)
 }
 
-fn merge_sam(paths: &[PathBuf], output_path: &Path, compress: bool) -> Result<u64> {
+fn merge_sam(
+    paths: &[PathBuf],
+    output_path: &Path,
+    compress: bool,
+    options: &MergeOptions,
+    on_progress: &mut Option<&mut dyn FnMut(u64, &str)>,
+) -> Result<u64> {
     let mut writer = open_sam_writer(output_path, compress)?;
     let mut count = 0u64;
 
     for (file_index, input_path) in paths.iter().enumerate() {
+        check_cancel(options.cancel.as_ref())?;
         let mut reader = sam::io::reader::Builder::default()
             .build_from_path(input_path)
             .with_context(|| format!("failed to open SAM '{}'", input_path.display()))?;
@@ -271,6 +332,7 @@ fn merge_sam(paths: &[PathBuf], output_path: &Path, compress: bool) -> Result<u6
         }
 
         for (index, result) in reader.records().enumerate() {
+            check_cancel(options.cancel.as_ref())?;
             let record = result.with_context(|| {
                 format!(
                     "invalid SAM record #{} in '{}'",
@@ -286,6 +348,9 @@ fn merge_sam(paths: &[PathBuf], output_path: &Path, compress: bool) -> Result<u6
                 )
             })?;
             count += 1;
+            if count % 1000 == 0 {
+                emit_progress(on_progress, count, &format!("merged {count} SAM records"));
+            }
         }
     }
 
@@ -293,87 +358,41 @@ fn merge_sam(paths: &[PathBuf], output_path: &Path, compress: bool) -> Result<u6
     Ok(count)
 }
 
-fn merge_bam(paths: &[PathBuf], output_path: &Path) -> Result<u64> {
-    let out_file = File::create(output_path)
-        .with_context(|| format!("failed to create BAM '{}'", output_path.display()))?;
-    let mut writer = bam::io::Writer::new(out_file);
-    let mut count = 0u64;
-
-    for (file_index, input_path) in paths.iter().enumerate() {
-        let file = File::open(input_path)
-            .with_context(|| format!("failed to open BAM '{}'", input_path.display()))?;
-        let mut reader = bam::io::Reader::new(file);
-        let header = reader
-            .read_header()
-            .with_context(|| format!("failed to read BAM header in '{}'", input_path.display()))?;
-
-        if file_index == 0 {
-            writer
-                .write_header(&header)
-                .context("failed to write merged BAM header")?;
-        }
-
-        for (index, result) in reader.records().enumerate() {
-            let record = result.with_context(|| {
-                format!(
-                    "invalid BAM record #{} in '{}'",
-                    index + 1,
-                    input_path.display()
-                )
-            })?;
-            writer.write_record(&header, &record).with_context(|| {
-                format!(
-                    "failed to write BAM record #{} from '{}'",
-                    index + 1,
-                    input_path.display()
-                )
-            })?;
-            count += 1;
-        }
-    }
-
+fn merge_bam_samtools(
+    paths: &[PathBuf],
+    output_path: &Path,
+    options: &MergeOptions,
+    on_progress: &mut Option<&mut dyn FnMut(u64, &str)>,
+) -> Result<u64> {
+    let samtools = options
+        .tool_paths
+        .resolve_samtools()
+        .context("samtools is required to merge BAM files")?;
+    emit_progress(on_progress, 0, "merging BAM files with samtools");
+    samtools_merge(&samtools, output_path, paths, None)?;
+    let count = samtools_view_count(&samtools, output_path, &[])?;
+    emit_progress(on_progress, count, &format!("merged {count} BAM records"));
     Ok(count)
 }
 
-fn merge_cram(paths: &[PathBuf], output_path: &Path) -> Result<u64> {
-    let out_file = File::create(output_path)
-        .with_context(|| format!("failed to create CRAM '{}'", output_path.display()))?;
-    let mut writer = cram::io::Writer::new(out_file);
-    let mut count = 0u64;
-
-    for (file_index, input_path) in paths.iter().enumerate() {
-        let file = File::open(input_path)
-            .with_context(|| format!("failed to open CRAM '{}'", input_path.display()))?;
-        let mut reader = cram::io::Reader::new(file);
-        let header = reader
-            .read_header()
-            .with_context(|| format!("failed to read CRAM header in '{}'", input_path.display()))?;
-
-        if file_index == 0 {
-            writer
-                .write_header(&header)
-                .context("failed to write merged CRAM header")?;
-        }
-
-        for (index, result) in reader.records(&header).enumerate() {
-            let record = result.with_context(|| {
-                format!(
-                    "invalid CRAM record #{} in '{}'",
-                    index + 1,
-                    input_path.display()
-                )
-            })?;
-            writer.write_record(&header, record).with_context(|| {
-                format!(
-                    "failed to write CRAM record #{} from '{}'",
-                    index + 1,
-                    input_path.display()
-                )
-            })?;
-            count += 1;
-        }
-    }
-
+fn merge_cram_samtools(
+    paths: &[PathBuf],
+    output_path: &Path,
+    options: &MergeOptions,
+    on_progress: &mut Option<&mut dyn FnMut(u64, &str)>,
+) -> Result<u64> {
+    let samtools = options
+        .tool_paths
+        .resolve_samtools()
+        .context("samtools is required to merge CRAM files")?;
+    let reference = options
+        .reference_path
+        .as_deref()
+        .context("CRAM merge requires a reference FASTA")?;
+    emit_progress(on_progress, 0, "merging CRAM files with samtools");
+    samtools_merge(&samtools, output_path, paths, Some(reference))?;
+    let count = samtools_view_count(&samtools, output_path, &[])?;
+    emit_progress(on_progress, count, &format!("merged {count} CRAM records"));
     Ok(count)
 }
 
@@ -382,15 +401,19 @@ fn merge_text_lines(
     output_path: &Path,
     compress: bool,
     format: FileFormat,
+    options: &MergeOptions,
+    on_progress: &mut Option<&mut dyn FnMut(u64, &str)>,
 ) -> Result<u64> {
     let mut writer = BufWriter::new(open_text_writer(output_path, compress)?);
     let mut count = 0u64;
 
     for (file_index, input_path) in paths.iter().enumerate() {
+        check_cancel(options.cancel.as_ref())?;
         let reader = open_line_reader(input_path)?;
         let mut saw_header = false;
 
         for (line_index, line) in reader.lines().enumerate() {
+            check_cancel(options.cancel.as_ref())?;
             let line = line.with_context(|| {
                 format!(
                     "failed to read line #{} in '{}'",
@@ -411,6 +434,9 @@ fn merge_text_lines(
                 .with_context(|| format!("failed to write merged line to '{}'", output_path.display()))?;
             if !line.starts_with('#') || format == FileFormat::GenBank {
                 count += 1;
+            }
+            if count % 1000 == 0 {
+                emit_progress(on_progress, count, &format!("merged {count} records"));
             }
         }
     }

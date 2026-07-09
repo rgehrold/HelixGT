@@ -1,4 +1,6 @@
-import type { LogLevel } from "$lib/types";
+import type { LogEntry, LogLevel } from "$lib/types";
+
+export const MAX_LOG_LINES = 500;
 
 export function inferLogLevel(message: string): LogLevel {
   const lowered = message.toLowerCase();
@@ -22,4 +24,9 @@ export function inferLogLevel(message: string): LogLevel {
     return "warn";
   }
   return "info";
+}
+
+export function appendLog(entries: LogEntry[], message: string, level?: LogLevel): LogEntry[] {
+  const next = [...entries, { level: level ?? inferLogLevel(message), message }];
+  return next.length > MAX_LOG_LINES ? next.slice(next.length - MAX_LOG_LINES) : next;
 }

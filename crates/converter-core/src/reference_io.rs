@@ -78,6 +78,10 @@ pub fn is_gzip_bytes(data: &[u8]) -> bool {
     data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b
 }
 
+pub fn ensure_reference_index(samtools: &std::path::Path, reference_path: &Path) -> Result<()> {
+    crate::external::samtools_faidx(samtools, reference_path)
+}
+
 pub fn is_gzip_path(path: &Path) -> bool {
     path.to_string_lossy()
         .to_ascii_lowercase()

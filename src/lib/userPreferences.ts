@@ -1,10 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { JobPreset, ToolMode, UserPreferences } from "$lib/types";
 
-export type UserPreferences = {
-  browseRoot?: string;
-  expandedDirs?: string[];
-  filesPaneWidth?: number;
-};
+export type { UserPreferences };
 
 const DEFAULT_FILES_PANE_WIDTH = 58;
 
@@ -53,4 +50,37 @@ function scheduleSave() {
     saveTimer = null;
     saveUserPreferencesNow();
   }, 400);
+}
+
+export function rememberMode(mode: ToolMode) {
+  patchUserPreferences({ activeMode: mode });
+}
+
+export function rememberOutputDir(mode: ToolMode, path: string) {
+  if (!path.trim()) return;
+  if (mode === "convert") patchUserPreferences({ convertOutputDir: path });
+  if (mode === "merge") patchUserPreferences({ mergeOutputDir: path });
+  if (mode === "align") patchUserPreferences({ alignOutputDir: path });
+}
+
+export function outputDirForMode(prefs: UserPreferences, mode: ToolMode) {
+  if (mode === "merge") return prefs.mergeOutputDir ?? "";
+  if (mode === "align") return prefs.alignOutputDir ?? "";
+  return prefs.convertOutputDir ?? "";
+}
+
+export function saveJobPreset(preset: JobPreset) {
+  const presets = [...(cache.jobPresets ?? [])];
+  const index = presets.findIndex((item) => item.id === preset.id);
+  if (index >= 0) presets[index] = preset;
+  else presets.unshift(preset);
+  patchUserPreferences({ jobPresets: presets.slice(0, 32) });
+  saveUserPreferencesNow();
+}
+
+export function deleteJobPreset(id: string) {
+  patchUserPreferences({
+    jobPresets: (cache.jobPresets ?? []).filter((preset) => preset.id !== id),
+  });
+  saveUserPreferencesNow();
 }

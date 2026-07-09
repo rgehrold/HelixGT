@@ -1,4 +1,5 @@
 mod alignment;
+mod annotation;
 mod genbank;
 mod sequence;
 mod variants;
@@ -33,20 +34,57 @@ impl Write for TextWriter {
     }
 }
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use rayon::prelude::*;
+
+use crate::cancel::CancelToken;
 use crate::external::index_alignment_output_if_needed;
 use crate::format::{infer_format, is_gzipped, output_filename, FileFormat};
+use crate::preflight::check_cancel;
+use crate::tools::{default_thread_count, helixgt_temp_file, ToolPaths};
 
 pub struct ConvertOptions {
     pub output_format: FileFormat,
     pub compress: bool,
     pub prefix: String,
     pub reference_path: Option<PathBuf>,
+    pub tool_paths: ToolPaths,
+    pub cancel: Option<CancelToken>,
+    pub thread_count: Option<usize>,
 }
 
+impl Default for ConvertOptions {
+    fn default() -> Self {
+        Self {
+            output_format: FileFormat::Fasta,
+            compress: false,
+            prefix: String::new(),
+            reference_path: None,
+            tool_paths: ToolPaths::default(),
+            cancel: None,
+            thread_count: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct ConvertedFile {
     pub input_path: PathBuf,
     pub output_path: PathBuf,
     pub records: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchConvertFailure {
+    pub input_path: PathBuf,
+    pub message: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchConvertResult {
+    pub files: Vec<ConvertedFile>,
+    pub failures: Vec<BatchConvertFailure>,
 }
 
 pub fn convert_file(input_path: &Path, output_path: &Path, options: &ConvertOptions) -> Result<u64> {
@@ -107,6 +145,14 @@ pub fn convert_file(input_path: &Path, output_path: &Path, options: &ConvertOpti
         return sequence::copy_bed(input_path, output_path, options).with_context(|| "bed transcode");
     }
 
+    if matches!(
+        (input_format, output_format),
+        (FileFormat::Gff, FileFormat::Bed) | (FileFormat::Bed, FileFormat::Gff)
+    ) {
+        return annotation::convert_annotation(input_path, output_path, input_format, output_format, options)
+            .with_context(|| format!("annotation conversion ({input_format} → {output_format})"));
+    }
+
     // Permissive bridges through FASTA.
     if output_format == FileFormat::Fasta {
         let intermediate = bridge_through_fasta(input_path, input_format, options)?;
@@ -127,8 +173,10 @@ pub fn convert_file(input_path: &Path, output_path: &Path, options: &ConvertOpti
             &ConvertOptions {
                 output_format: FileFormat::Fastq,
                 compress: options.compress,
-                prefix: String::new(),
-                reference_path: None,
+                tool_paths: options.tool_paths.clone(),
+                cancel: options.cancel.clone(),
+                thread_count: options.thread_count,
+                ..Default::default()
             },
         )
         .with_context(|| format!("writing bridged fastq ({input_format} → fastq)"))?;
@@ -175,12 +223,12 @@ fn bridge_through_fasta(
     input_format: FileFormat,
     _options: &ConvertOptions,
 ) -> Result<PathBuf> {
-    let temp_dir = std::env::temp_dir();
     let stem = input_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("bridge");
-    let temp_path = temp_dir.join(format!("ugt_bridge_{stem}_{}.fasta", std::process::id()));
+    let _ = crate::tools::ensure_temp_dir();
+    let temp_path = helixgt_temp_file(stem, "fasta");
 
     if input_format.is_alignment() {
         alignment::to_sequence(
@@ -191,8 +239,10 @@ fn bridge_through_fasta(
             &ConvertOptions {
                 output_format: FileFormat::Fasta,
                 compress: false,
-                prefix: String::new(),
-                reference_path: None,
+                tool_paths: _options.tool_paths.clone(),
+                cancel: _options.cancel.clone(),
+                thread_count: _options.thread_count,
+                ..Default::default()
             },
         )?;
     } else if input_format == FileFormat::GenBank {
@@ -204,8 +254,10 @@ fn bridge_through_fasta(
             &ConvertOptions {
                 output_format: FileFormat::Fasta,
                 compress: false,
-                prefix: String::new(),
-                reference_path: None,
+                tool_paths: _options.tool_paths.clone(),
+                cancel: _options.cancel.clone(),
+                thread_count: _options.thread_count,
+                ..Default::default()
             },
         )?;
     } else {
@@ -219,54 +271,100 @@ pub fn batch_convert(
     input_paths: &[PathBuf],
     output_dir: &Path,
     options: &ConvertOptions,
-    mut on_progress: impl FnMut(usize, usize, &str),
-) -> Result<Vec<ConvertedFile>> {
+    on_progress: impl Fn(usize, usize, &str) + Sync,
+) -> Result<BatchConvertResult> {
     std::fs::create_dir_all(output_dir)
         .with_context(|| format!("cannot create output directory '{}'", output_dir.display()))?;
 
     let total = input_paths.len();
-    let mut results = Vec::with_capacity(total);
+    check_cancel(options.cancel.as_ref())?;
 
-    for (index, input_path) in input_paths.iter().enumerate() {
-        let file_name = input_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("file");
-        on_progress(index + 1, total, file_name);
+    let thread_count = options.thread_count.unwrap_or_else(default_thread_count);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(thread_count)
+        .build()
+        .context("failed to build conversion thread pool")?;
 
-        let mut out_name = output_filename(input_path, options.output_format, options.compress);
-        if !options.prefix.is_empty() {
-            let prefix = options.prefix.trim_end_matches('_');
-            out_name = format!("{prefix}_{out_name}");
-        }
+    let completed = AtomicUsize::new(0);
+    let errors: std::sync::Mutex<Vec<BatchConvertFailure>> = std::sync::Mutex::new(Vec::new());
 
-        let output_path = output_dir.join(out_name);
-        let records = convert_file(input_path, &output_path, options).with_context(|| {
-            format!(
-                "converting '{}' ({}) to '{}' ({})",
-                input_path.display(),
-                infer_format(input_path)
-                    .map(|f| f.to_string())
-                    .unwrap_or_else(|_| "unknown".into()),
-                output_path.display(),
-                options.output_format
-            )
-        })?;
+    let mut results: Vec<ConvertedFile> = pool.install(|| {
+        input_paths
+            .par_iter()
+            .filter_map(|input_path| {
+                if let Err(error) = check_cancel(options.cancel.as_ref()) {
+                    if let Ok(mut failures) = errors.lock() {
+                        failures.push(BatchConvertFailure {
+                            input_path: input_path.clone(),
+                            message: format!("{error:#}"),
+                        });
+                    }
+                    return None;
+                }
 
-        if matches!(options.output_format, FileFormat::Bam | FileFormat::Cram) {
-            index_alignment_output_if_needed(&output_path).with_context(|| {
-                format!("failed to index '{}'", output_path.display())
-            })?;
-        }
+                let file_name = input_path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file");
 
-        results.push(ConvertedFile {
-            input_path: input_path.clone(),
-            output_path,
-            records,
-        });
+                let mut out_name =
+                    output_filename(input_path, options.output_format, options.compress);
+                if !options.prefix.is_empty() {
+                    let prefix = options.prefix.trim_end_matches('_');
+                    out_name = format!("{prefix}_{out_name}");
+                }
+
+                let output_path = output_dir.join(out_name);
+                match convert_file(input_path, &output_path, options) {
+                    Ok(records) => {
+                        if matches!(options.output_format, FileFormat::Bam | FileFormat::Cram) {
+                            if let Err(error) = index_alignment_output_if_needed(
+                                &output_path,
+                                &options.tool_paths,
+                            ) {
+                                if let Ok(mut failures) = errors.lock() {
+                                    failures.push(BatchConvertFailure {
+                                        input_path: input_path.clone(),
+                                        message: format!("{error:#}"),
+                                    });
+                                }
+                                return None;
+                            }
+                        }
+                        let current = completed.fetch_add(1, Ordering::SeqCst) + 1;
+                        on_progress(current, total, file_name);
+                        Some(ConvertedFile {
+                            input_path: input_path.clone(),
+                            output_path,
+                            records,
+                        })
+                    }
+                    Err(error) => {
+                        if let Ok(mut failures) = errors.lock() {
+                            failures.push(BatchConvertFailure {
+                                input_path: input_path.clone(),
+                                message: format!("{error:#}"),
+                            });
+                        }
+                        None
+                    }
+                }
+            })
+            .collect()
+    });
+
+    let failures = errors.into_inner().unwrap_or_default();
+    if results.is_empty() && !failures.is_empty() {
+        let summary = failures
+            .iter()
+            .map(|failure| format!("{}: {}", failure.input_path.display(), failure.message))
+            .collect::<Vec<_>>()
+            .join("\n");
+        anyhow::bail!("batch conversion failed:\n{summary}");
     }
 
-    Ok(results)
+    results.sort_by(|left, right| left.input_path.cmp(&right.input_path));
+    Ok(BatchConvertResult { files: results, failures })
 }
 
 pub(crate) fn open_text_reader(path: &Path) -> Result<Box<dyn Read>> {

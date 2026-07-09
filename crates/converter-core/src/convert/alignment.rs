@@ -15,7 +15,7 @@ use noodles::sam::alignment::Record as AlignmentRecord;
 
 use super::{finish_gzip_writer, flush_dyn_writer, open_buf_reader, open_buf_writer, ConvertOptions};
 use crate::external::{
-    resolve_cram_reference, resolve_samtools_path, samtools_view_from_cram, samtools_view_to_cram,
+    resolve_cram_reference, samtools_view_from_cram, samtools_view_to_cram,
 };
 use crate::format::FileFormat;
 
@@ -72,15 +72,14 @@ pub fn from_sequence(
         (FileFormat::Fasta, FileFormat::Sam) => fasta_to_sam(input_path, output_path, options),
         (FileFormat::Fastq, FileFormat::Sam) => fastq_to_sam(input_path, output_path, options),
         (FileFormat::Fasta, FileFormat::Bam) => {
-            let temp = std::env::temp_dir().join(format!("ugt_sam_{}.sam", std::process::id()));
+            let temp = crate::tools::helixgt_temp_file("seq_sam", "sam");
             fasta_to_sam(
                 input_path,
                 &temp,
                 &ConvertOptions {
                     output_format: FileFormat::Sam,
                     compress: false,
-                    prefix: String::new(),
-                    reference_path: None,
+                    ..Default::default()
                 },
             )?;
             let count = sam_to_bam(&temp, output_path)?;
@@ -88,15 +87,14 @@ pub fn from_sequence(
             Ok(count)
         }
         (FileFormat::Fastq, FileFormat::Bam) => {
-            let temp = std::env::temp_dir().join(format!("ugt_sam_{}.sam", std::process::id()));
+            let temp = crate::tools::helixgt_temp_file("seq_sam", "sam");
             fastq_to_sam(
                 input_path,
                 &temp,
                 &ConvertOptions {
                     output_format: FileFormat::Sam,
                     compress: false,
-                    prefix: String::new(),
-                    reference_path: None,
+                    ..Default::default()
                 },
             )?;
             let count = sam_to_bam(&temp, output_path)?;
@@ -153,7 +151,7 @@ pub fn copy_bam(input_path: &Path, output_path: &Path) -> Result<u64> {
 }
 
 pub fn copy_cram(input_path: &Path, output_path: &Path, options: &ConvertOptions) -> Result<u64> {
-    let samtools = resolve_samtools_path(&[]).context(
+    let samtools = options.tool_paths.resolve_samtools().context(
         "samtools is required for CRAM conversion. Place samtools.exe in src-tauri/binaries/ or add it to PATH.",
     )?;
     let reference = resolve_cram_reference(input_path, options.reference_path.as_deref())?;
@@ -218,13 +216,13 @@ fn bam_to_sam(input_path: &Path, output_path: &Path, options: &ConvertOptions) -
 }
 
 fn cram_to_sam(input_path: &Path, output_path: &Path, options: &ConvertOptions) -> Result<u64> {
-    let samtools = resolve_samtools_path(&[]).context(
+    let samtools = options.tool_paths.resolve_samtools().context(
         "samtools is required for CRAM conversion. Place samtools.exe in src-tauri/binaries/ or add it to PATH.",
     )?;
     let reference = resolve_cram_reference(input_path, options.reference_path.as_deref())?;
 
     if options.compress {
-        let temp = std::env::temp_dir().join(format!("ugt_cram_sam_{}.sam", std::process::id()));
+        let temp = crate::tools::helixgt_temp_file("cram_sam", "sam");
         let count = samtools_view_from_cram(&samtools, input_path, &temp, &reference, false)?;
         transcode_sam(&temp, output_path, options)?;
         let _ = std::fs::remove_file(temp);
@@ -235,7 +233,7 @@ fn cram_to_sam(input_path: &Path, output_path: &Path, options: &ConvertOptions) 
 }
 
 fn cram_to_bam(input_path: &Path, output_path: &Path, options: &ConvertOptions) -> Result<u64> {
-    let samtools = resolve_samtools_path(&[]).context(
+    let samtools = options.tool_paths.resolve_samtools().context(
         "samtools is required for CRAM conversion. Place samtools.exe in src-tauri/binaries/ or add it to PATH.",
     )?;
     let reference = resolve_cram_reference(input_path, options.reference_path.as_deref())?;
@@ -271,15 +269,16 @@ fn bam_to_fastq(input_path: &Path, output_path: &Path, options: &ConvertOptions)
 }
 
 fn cram_to_fasta(input_path: &Path, output_path: &Path, options: &ConvertOptions) -> Result<u64> {
-    let temp = std::env::temp_dir().join(format!("ugt_cram_sam_{}.sam", std::process::id()));
+    let temp = crate::tools::helixgt_temp_file("cram_sam", "sam");
     cram_to_sam(
         input_path,
         &temp,
         &ConvertOptions {
             output_format: FileFormat::Sam,
             compress: false,
-            prefix: String::new(),
             reference_path: options.reference_path.clone(),
+            tool_paths: options.tool_paths.clone(),
+            ..Default::default()
         },
     )?;
     let count = sam_to_fasta(&temp, output_path, options)?;
@@ -288,15 +287,16 @@ fn cram_to_fasta(input_path: &Path, output_path: &Path, options: &ConvertOptions
 }
 
 fn cram_to_fastq(input_path: &Path, output_path: &Path, options: &ConvertOptions) -> Result<u64> {
-    let temp = std::env::temp_dir().join(format!("ugt_cram_sam_{}.sam", std::process::id()));
+    let temp = crate::tools::helixgt_temp_file("cram_sam", "sam");
     cram_to_sam(
         input_path,
         &temp,
         &ConvertOptions {
             output_format: FileFormat::Sam,
             compress: false,
-            prefix: String::new(),
             reference_path: options.reference_path.clone(),
+            tool_paths: options.tool_paths.clone(),
+            ..Default::default()
         },
     )?;
     let count = sam_to_fastq(&temp, output_path, options)?;
@@ -488,7 +488,7 @@ fn alignment_to_cram(input_path: &Path, output_path: &Path, options: &ConvertOpt
         .reference_path
         .as_deref()
         .context("CRAM conversion requires a reference FASTA. Choose a reference file first.")?;
-    let samtools = resolve_samtools_path(&[]).context(
+    let samtools = options.tool_paths.resolve_samtools().context(
         "samtools is required for CRAM conversion. Place samtools.exe in src-tauri/binaries/ or add it to PATH.",
     )?;
     samtools_view_to_cram(&samtools, input_path, output_path, reference)

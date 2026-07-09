@@ -1,5 +1,5 @@
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use thiserror::Error;
@@ -163,6 +163,36 @@ pub fn infer_format(path: &Path) -> Result<FileFormat, UnknownFormatError> {
 
 pub fn is_compatible_file(path: &Path) -> bool {
     infer_format(path).is_ok()
+}
+
+pub fn suggest_output_format(paths: &[PathBuf]) -> Option<FileFormat> {
+    if paths.is_empty() {
+        return None;
+    }
+
+    let mut counts = std::collections::HashMap::<FileFormat, usize>::new();
+    for path in paths {
+        if let Ok(format) = infer_format(path) {
+            *counts.entry(format).or_default() += 1;
+        }
+    }
+
+    let (dominant, _) = counts.iter().max_by_key(|(_, count)| *count)?;
+    let dominant = *dominant;
+
+    let suggestion = match dominant {
+        FileFormat::Fastq => FileFormat::Fasta,
+        FileFormat::Fasta => FileFormat::Fastq,
+        FileFormat::Sam => FileFormat::Bam,
+        FileFormat::Bam => FileFormat::Cram,
+        FileFormat::Cram => FileFormat::Bam,
+        FileFormat::Gff => FileFormat::Bed,
+        FileFormat::Bed => FileFormat::Gff,
+        FileFormat::GenBank => FileFormat::Fasta,
+        other => other,
+    };
+
+    Some(suggestion)
 }
 
 pub fn output_filename(input_path: &Path, out_format: FileFormat, compress: bool) -> String {

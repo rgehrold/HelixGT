@@ -5,6 +5,7 @@
     setMode,
     setPalette,
     theme,
+    toggleMode,
     togglePalette,
     wordmarkSrc,
   } from "$lib/theme.svelte";
@@ -123,6 +124,9 @@
           <button class="dropdown-item" class:selected={theme.palette === "orange"} onclick={() => choosePalette("orange")}>
             <span class="check">{theme.palette === "orange" ? "✓" : ""}</span>
             Orange theme
+          </button>
+          <button class="dropdown-item" onclick={() => { toggleMode(); closeMenus(); }}>
+            Toggle dark / light
           </button>
           <div class="dropdown-sep" role="separator"></div>
           <button class="dropdown-item" onclick={restoreView}>Restore standard view</button>

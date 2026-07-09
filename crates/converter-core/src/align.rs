@@ -11,10 +11,13 @@ use flate2::Compression;
 
 use std::sync::Arc;
 
+use crate::cancel::CancelToken;
 use crate::external::{
     index_path_for, new_command, run_command, run_command_logged, samtools_flagstat, samtools_index,
     ToolLogSink,
 };
+use crate::preflight::check_cancel;
+use crate::tools::default_thread_count;
 
 #[derive(Clone)]
 pub struct AlignOptions {
@@ -24,6 +27,8 @@ pub struct AlignOptions {
     pub minimap2: Minimap2Options,
     pub samtools_exe: PathBuf,
     pub tool_log: Option<Arc<dyn ToolLogSink + Send + Sync>>,
+    pub cancel: Option<CancelToken>,
+    pub thread_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -33,6 +38,8 @@ pub struct Minimap2Options {
     pub sort_output: bool,
     pub secondary_alignments: bool,
     pub index_output: bool,
+    pub filter_unmapped: bool,
+    pub mark_duplicates: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -42,6 +49,8 @@ pub enum Minimap2Preset {
     ShortReads,
     Ont,
     Hifi,
+    Splice,
+    Asm5,
 }
 
 impl Minimap2Preset {
@@ -50,6 +59,8 @@ impl Minimap2Preset {
             "sr" | "short" | "short_reads" => Self::ShortReads,
             "ont" | "map-ont" | "nanopore" => Self::Ont,
             "hifi" | "map-hifi" | "pacbio" => Self::Hifi,
+            "splice" | "rna" | "rnaseq" => Self::Splice,
+            "asm5" | "assembly" => Self::Asm5,
             _ => Self::General,
         }
     }
@@ -60,6 +71,8 @@ impl Minimap2Preset {
             Self::ShortReads => Some("sr"),
             Self::Ont => Some("map-ont"),
             Self::Hifi => Some("map-hifi"),
+            Self::Splice => Some("splice"),
+            Self::Asm5 => Some("asm5"),
         }
     }
 }
@@ -127,7 +140,7 @@ fn align_with_minimap2(
     output_path: &Path,
     options: &AlignOptions,
 ) -> Result<AlignResult> {
-    let temp_dir = std::env::temp_dir().join(format!("ugt_align_{}", std::process::id()));
+    let temp_dir = crate::tools::helixgt_temp_dir().join(format!("align_{}", std::process::id()));
     std::fs::create_dir_all(&temp_dir).context("failed to create temporary alignment directory")?;
 
     let reference_target = if options.minimap2.index_reference {
@@ -182,7 +195,9 @@ fn align_with_minimap2(
         view_output
     };
 
-    let final_output = match options.output_format {
+    check_cancel(options.cancel.as_ref())?;
+
+    let mut final_output = match options.output_format {
         AlignOutputFormat::Sam => {
             if options.compress {
                 gzip_file(&working_output, output_path)?;
@@ -214,6 +229,48 @@ fn align_with_minimap2(
             output_path.to_path_buf()
         }
     };
+
+    if options.minimap2.filter_unmapped {
+        let filtered = temp_dir.join("aligned.filtered.bam");
+        filter_unmapped_reads(
+            samtools,
+            reference_str,
+            &final_output,
+            &filtered,
+            options.output_format,
+            options.tool_log.clone(),
+        )?;
+        if options.output_format == AlignOutputFormat::Sam {
+            if options.compress {
+                gzip_file(&filtered, output_path)?;
+            } else {
+                std::fs::copy(&filtered, output_path)?;
+            }
+            final_output = output_path.to_path_buf();
+        } else if options.output_format == AlignOutputFormat::Cram {
+            let mut cram_cmd = new_command(samtools);
+            cram_cmd.args([
+                "view",
+                "-C",
+                "-T",
+                reference_str,
+                "-o",
+                output_path.to_str().context("invalid output path")?,
+                filtered.to_str().context("invalid temp path")?,
+            ]);
+            run_logged(cram_cmd, "samtools view", options.tool_log.clone())?;
+            final_output = output_path.to_path_buf();
+        } else {
+            std::fs::copy(&filtered, output_path)?;
+            final_output = output_path.to_path_buf();
+        }
+    }
+
+    if options.minimap2.mark_duplicates && matches!(options.output_format, AlignOutputFormat::Bam | AlignOutputFormat::Cram) {
+        let marked = temp_dir.join("aligned.markdup.bam");
+        mark_duplicates(samtools, &final_output, &marked, options.tool_log.clone())?;
+        std::fs::copy(&marked, &final_output)?;
+    }
 
     let index_path = if options.minimap2.index_output
         && matches!(
@@ -278,8 +335,10 @@ fn pipe_minimap2_to_samtools_view(
         .to_str()
         .context("output path is not valid UTF-8")?;
 
+    let threads = default_thread_count();
+
     let mut minimap2 = new_command(minimap2_exe);
-    minimap2.arg("-a");
+    minimap2.arg("-a").args(["-t", &threads.to_string()]);
     if let Some(preset) = minimap2_options.preset.flag() {
         minimap2.arg("-x").arg(preset);
     }
@@ -356,7 +415,8 @@ fn sort_alignment(
     let input = input_path.to_str().context("invalid sort input path")?;
     let output = output_path.to_str().context("invalid sort output path")?;
     let mut command = new_command(samtools_exe);
-    command.arg("sort");
+    let threads = default_thread_count();
+    command.arg("sort").args(["-@", &threads.to_string()]);
     match output_format {
         AlignOutputFormat::Sam => {
             command.args(["-O", "sam"]);
@@ -408,6 +468,41 @@ fn read_stream_to_string(stream: &mut impl Read) -> Result<String> {
         .read_to_string(&mut buffer)
         .context("failed to read process stderr")?;
     Ok(buffer)
+}
+
+fn filter_unmapped_reads(
+    samtools_exe: &Path,
+    reference_fasta: &str,
+    input_path: &Path,
+    output_path: &Path,
+    output_format: AlignOutputFormat,
+    log: Option<Arc<dyn ToolLogSink + Send + Sync>>,
+) -> Result<()> {
+    let input = input_path.to_str().context("invalid filter input path")?;
+    let output = output_path.to_str().context("invalid filter output path")?;
+    let mut command = new_command(samtools_exe);
+    command.args(["view", "-h", "-F", "4", "-T", reference_fasta]);
+    match output_format {
+        AlignOutputFormat::Sam => {}
+        AlignOutputFormat::Bam | AlignOutputFormat::Cram => {
+            command.arg("-b");
+        }
+    }
+    command.args(["-o", output, input]);
+    run_logged(command, "samtools view", log)
+}
+
+fn mark_duplicates(
+    samtools_exe: &Path,
+    input_path: &Path,
+    output_path: &Path,
+    log: Option<Arc<dyn ToolLogSink + Send + Sync>>,
+) -> Result<()> {
+    let input = input_path.to_str().context("invalid markdup input path")?;
+    let output = output_path.to_str().context("invalid markdup output path")?;
+    let mut command = new_command(samtools_exe);
+    command.args(["markdup", "-@", &default_thread_count().to_string(), output, input]);
+    run_logged(command, "samtools markdup", log)
 }
 
 pub fn output_alignment_path(

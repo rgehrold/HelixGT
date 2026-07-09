@@ -19,6 +19,8 @@ export interface ConvertResultItem {
 export interface ConvertSummary {
   files: ConvertResultItem[];
   totalRecords: number;
+  partialFailure?: boolean;
+  errorMessage?: string | null;
 }
 
 export interface DirEntry {
@@ -45,6 +47,11 @@ export interface MergeSummary {
   outputPath: string;
   records: number;
   inputCount: number;
+}
+
+export interface MergeProgress {
+  records: number;
+  message: string;
 }
 
 export interface EnsemblReferenceInfo {
@@ -93,4 +100,55 @@ export interface ToolLogEvent {
   tool: string;
   stream: string;
   line: string;
+}
+
+export interface PreflightIssue {
+  severity: "error" | "warning";
+  message: string;
+}
+
+export interface PreflightResponse {
+  ok: boolean;
+  issues: PreflightIssue[];
+  estimatedOutputBytes: number;
+}
+
+export interface FastqQcSummary {
+  readCount: number;
+  totalBases: number;
+  meanReadLength: number;
+  minReadLength: number;
+  maxReadLength: number;
+  nContentFraction: number;
+}
+
+export interface JobPreset {
+  id: string;
+  name: string;
+  mode: ToolMode;
+  outputFormat?: string;
+  outputDir?: string;
+  compress?: boolean;
+  referenceId?: string;
+  alignPreset?: string;
+  sortOutput?: boolean;
+  indexOutput?: boolean;
+  filterUnmapped?: boolean;
+  markDuplicates?: boolean;
+}
+
+export interface UserPreferences {
+  browseRoot?: string;
+  expandedDirs?: string[];
+  filesPaneWidth?: number;
+  activeMode?: ToolMode;
+  convertOutputDir?: string;
+  mergeOutputDir?: string;
+  alignOutputDir?: string;
+  outputFormat?: string;
+  alignReferenceId?: string;
+  alignPreset?: string;
+  alignOutputFormat?: string;
+  recentFiles?: string[];
+  jobPresets?: JobPreset[];
 }

@@ -1,4 +1,6 @@
 mod filesystem;
+mod jobs;
+mod presets;
 mod reference;
 mod user_preferences;
 
@@ -6,11 +8,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use converter_core::{
-    align_reads_to_reference, batch_convert, is_compatible_file, merge_files,
-    output_alignment_path, resolve_minimap2_path, resolve_samtools_path, suggest_merge_filename,
-    validate_merge_inputs, AlignOptions, AlignOutputFormat, ConvertOptions, ConvertedFile,
-    FileFormat, MergeOptions, Minimap2Options, Minimap2Preset, ToolLogSink,
+    align_reads_to_reference, batch_convert, fastq_qc, is_compatible_file, merge_files,
+    output_alignment_path, resolve_minimap2_path, resolve_samtools_path, run_preflight,
+    suggest_merge_filename, suggest_output_format, validate_merge_inputs, AlignOptions,
+    AlignOutputFormat, ConvertOptions, ConvertedFile, FastqQcSummary, FileFormat, MergeOptions,
+    Minimap2Options, Minimap2Preset, PreflightMode, PreflightReport, PreflightRequest, ToolLogSink,
+    ToolPaths,
 };
+use jobs::JobManager;
+
 use reference::{
     CachedReferenceInfo, EnsemblReferenceInfo, ReferenceFetchResult, ReferenceStore,
     SharedReferenceStore,
@@ -53,6 +59,8 @@ struct ConvertResultItem {
 struct ConvertSummary {
     files: Vec<ConvertResultItem>,
     total_records: u64,
+    partial_failure: bool,
+    error_message: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -64,6 +72,7 @@ struct ConvertRequest {
     compress: bool,
     prefix: Option<String>,
     reference_path: Option<String>,
+    job_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,6 +108,15 @@ struct MergeRequest {
     output_dir: String,
     output_name: String,
     compress: Option<bool>,
+    reference_path: Option<String>,
+    job_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MergeProgress {
+    records: u64,
+    message: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -150,6 +168,120 @@ struct AlignRequest {
     sort_output: bool,
     secondary_alignments: bool,
     index_output: bool,
+    filter_unmapped: bool,
+    mark_duplicates: bool,
+    job_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreflightRequestPayload {
+    mode: String,
+    input_paths: Vec<String>,
+    output_dir: String,
+    output_format: Option<String>,
+    reference_path: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PreflightIssueResponse {
+    severity: String,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PreflightResponse {
+    ok: bool,
+    issues: Vec<PreflightIssueResponse>,
+    estimated_output_bytes: u64,
+}
+
+fn tool_paths_for_app(app: &AppHandle) -> ToolPaths {
+    ToolPaths {
+        minimap2: resolve_minimap2_for_app(app),
+        samtools: resolve_samtools_for_app(app),
+    }
+}
+
+fn reference_cache_dir(app: &AppHandle) -> PathBuf {
+    app.path()
+        .app_data_dir()
+        .unwrap_or_else(|_| std::env::temp_dir())
+        .join("helixgt")
+        .join("references")
+}
+
+#[tauri::command]
+fn suggest_output_format_for_paths(paths: Vec<String>) -> Option<String> {
+    let path_bufs: Vec<PathBuf> = paths.into_iter().map(PathBuf::from).collect();
+    suggest_output_format(&path_bufs).map(|format| format.as_str().to_string())
+}
+
+#[tauri::command]
+fn run_preflight_check(app: AppHandle, request: PreflightRequestPayload) -> PreflightResponse {
+    let mode = match request.mode.as_str() {
+        "merge" => PreflightMode::Merge,
+        "align" => PreflightMode::Align,
+        _ => PreflightMode::Convert,
+    };
+    let output_format = request
+        .output_format
+        .as_deref()
+        .and_then(|value| value.parse::<FileFormat>().ok());
+    let needs_samtools = output_format == Some(FileFormat::Cram)
+        || request
+            .input_paths
+            .iter()
+            .any(|path| path.to_ascii_lowercase().ends_with(".cram"));
+    let report = run_preflight(&PreflightRequest {
+        mode,
+        input_paths: request.input_paths.into_iter().map(PathBuf::from).collect(),
+        output_dir: PathBuf::from(request.output_dir),
+        output_format,
+        reference_path: request.reference_path.map(PathBuf::from),
+        tool_paths: tool_paths_for_app(&app),
+        needs_samtools,
+        needs_minimap2: mode == PreflightMode::Align,
+    })
+    .unwrap_or(PreflightReport {
+        ok: false,
+        issues: vec![converter_core::PreflightIssue {
+            severity: converter_core::PreflightSeverity::Error,
+            message: "preflight check failed".into(),
+        }],
+        estimated_output_bytes: 0,
+    });
+    to_preflight_response(report)
+}
+
+fn to_preflight_response(report: PreflightReport) -> PreflightResponse {
+    PreflightResponse {
+        ok: report.ok,
+        issues: report
+            .issues
+            .into_iter()
+            .map(|issue| PreflightIssueResponse {
+                severity: match issue.severity {
+                    converter_core::PreflightSeverity::Error => "error".into(),
+                    converter_core::PreflightSeverity::Warning => "warning".into(),
+                },
+                message: issue.message,
+            })
+            .collect(),
+        estimated_output_bytes: report.estimated_output_bytes,
+    }
+}
+
+#[tauri::command]
+fn run_fastq_qc(path: String) -> Result<FastqQcSummary, String> {
+    fastq_qc(PathBuf::from(path).as_path()).map_err(|error| format!("{error:#}"))
+}
+
+#[tauri::command]
+fn cancel_job(jobs: tauri::State<'_, Arc<JobManager>>, job_id: String) -> bool {
+    jobs.cancel(&job_id)
 }
 
 #[tauri::command]
@@ -234,8 +366,19 @@ fn validate_input_paths(paths: Vec<String>) -> Vec<String> {
 }
 
 #[tauri::command]
-async fn run_conversion(app: AppHandle, request: ConvertRequest) -> Result<ConvertSummary, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+async fn run_conversion(
+    app: AppHandle,
+    jobs: tauri::State<'_, Arc<JobManager>>,
+    request: ConvertRequest,
+) -> Result<ConvertSummary, String> {
+    let job_id = request
+        .job_id
+        .clone()
+        .unwrap_or_else(|| format!("convert-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|value| value.as_millis()).unwrap_or(0)));
+    let cancel = jobs.start(&job_id);
+    let app_for_task = app.clone();
+    let recent_paths = request.input_paths.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let output_format = request
             .output_format
             .parse::<FileFormat>()
@@ -256,12 +399,15 @@ async fn run_conversion(app: AppHandle, request: ConvertRequest) -> Result<Conve
             compress: request.compress,
             prefix: request.prefix.unwrap_or_default(),
             reference_path: request.reference_path.map(PathBuf::from),
+            tool_paths: tool_paths_for_app(&app_for_task),
+            cancel: Some(cancel),
+            thread_count: None,
         };
 
         let output_dir = PathBuf::from(&request.output_dir);
 
-        let results = batch_convert(&input_paths, &output_dir, &options, |current, total, name| {
-            let _ = app.emit(
+        let batch = batch_convert(&input_paths, &output_dir, &options, |current, total, name| {
+            let _ = app_for_task.emit(
                 "convert-progress",
                 ConvertProgress {
                     current,
@@ -271,11 +417,26 @@ async fn run_conversion(app: AppHandle, request: ConvertRequest) -> Result<Conve
             );
         })
         .map_err(|error| format!("{error:#}"))?;
-
-        Ok(summary_from_results(results))
+        let partial = !batch.failures.is_empty();
+        let error_message = if partial {
+            Some(
+                batch
+                    .failures
+                    .iter()
+                    .map(|failure| format!("{}: {}", failure.input_path.display(), failure.message))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+        } else {
+            None
+        };
+        Ok(summary_from_results(batch.files, partial, error_message))
     })
     .await
-    .map_err(|error| format!("conversion task failed: {error}"))?
+    .map_err(|error| format!("conversion task failed: {error}"))?;
+    jobs.finish(&job_id);
+    user_preferences::record_recent_files(&app, &recent_paths);
+    result
 }
 
 #[tauri::command]
@@ -303,20 +464,40 @@ fn suggest_merged_filename(paths: Vec<String>) -> MergeSuggestionResponse {
 }
 
 #[tauri::command]
-async fn run_merge(request: MergeRequest) -> Result<MergeSummary, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+async fn run_merge(app: AppHandle, jobs: tauri::State<'_, Arc<JobManager>>, request: MergeRequest) -> Result<MergeSummary, String> {
+    let job_id = request
+        .job_id
+        .clone()
+        .unwrap_or_else(|| format!("merge-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|value| value.as_millis()).unwrap_or(0)));
+    let cancel = jobs.start(&job_id);
+    let app_for_task = app.clone();
+    let recent_paths = request.input_paths.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
         let input_paths: Vec<PathBuf> = request
             .input_paths
             .into_iter()
             .map(PathBuf::from)
             .collect();
+        let mut progress_callback = |records: u64, message: &str| {
+            let _ = app_for_task.emit(
+                "merge-progress",
+                MergeProgress {
+                    records,
+                    message: message.to_string(),
+                },
+            );
+        };
         let result = merge_files(
             &input_paths,
             PathBuf::from(&request.output_dir).as_path(),
             &MergeOptions {
                 output_name: request.output_name,
                 compress: request.compress,
+                tool_paths: tool_paths_for_app(&app_for_task),
+                reference_path: request.reference_path.map(PathBuf::from),
+                cancel: Some(cancel),
             },
+            Some(&mut progress_callback),
         )
         .map_err(|error| format!("{error:#}"))?;
 
@@ -327,7 +508,10 @@ async fn run_merge(request: MergeRequest) -> Result<MergeSummary, String> {
         })
     })
     .await
-    .map_err(|error| format!("merge task failed: {error}"))?
+    .map_err(|error| format!("merge task failed: {error}"))?;
+    jobs.finish(&job_id);
+    user_preferences::record_recent_files(&app, &recent_paths);
+    result
 }
 
 #[tauri::command]
@@ -417,19 +601,33 @@ fn samtools_is_available(app: AppHandle) -> bool {
 #[tauri::command]
 async fn run_alignment(
     app: AppHandle,
+    jobs: tauri::State<'_, Arc<JobManager>>,
     store: tauri::State<'_, SharedReferenceStore>,
     request: AlignRequest,
 ) -> Result<AlignSummary, String> {
+    let job_id = request
+        .job_id
+        .clone()
+        .unwrap_or_else(|| format!("align-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|value| value.as_millis()).unwrap_or(0)));
+    let cancel = jobs.start(&job_id);
     let store = store.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || run_alignment_inner(&app, &store, request))
+    let read_paths = request.read_paths.clone();
+    let app_for_task = app.clone();
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        run_alignment_inner(&app_for_task, &store, request, Some(cancel))
+    })
         .await
-        .map_err(|error| format!("alignment task failed: {error}"))?
+        .map_err(|error| format!("alignment task failed: {error}"))?;
+    jobs.finish(&job_id);
+    user_preferences::record_recent_files(&app, &read_paths);
+    result
 }
 
 fn run_alignment_inner(
     app: &AppHandle,
     store: &ReferenceStore,
     request: AlignRequest,
+    cancel: Option<converter_core::CancelToken>,
 ) -> Result<AlignSummary, String> {
     let read_paths: Vec<PathBuf> = request.read_paths.into_iter().map(PathBuf::from).collect();
     if read_paths.is_empty() {
@@ -447,6 +645,9 @@ fn run_alignment_inner(
     std::fs::create_dir_all(&output_dir).map_err(|error| format!("cannot create output folder: {error}"))?;
 
     let reference_path = store.reference_path(&request.reference_id)?;
+    if let Some(samtools) = resolve_samtools_for_app(app) {
+        let _ = store.ensure_index(&samtools, &request.reference_id);
+    }
 
     let output_path = output_alignment_path(
         output_dir.as_path(),
@@ -470,9 +671,13 @@ fn run_alignment_inner(
                 sort_output: request.sort_output,
                 secondary_alignments: request.secondary_alignments,
                 index_output: request.index_output,
+                filter_unmapped: request.filter_unmapped,
+                mark_duplicates: request.mark_duplicates,
             },
             samtools_exe,
             tool_log: Some(tool_log),
+            cancel,
+            thread_count: None,
         },
     )
     .map_err(|error| format!("{error:#}"))?;
@@ -488,7 +693,11 @@ fn run_alignment_inner(
     })
 }
 
-fn summary_from_results(results: Vec<ConvertedFile>) -> ConvertSummary {
+fn summary_from_results(
+    results: Vec<ConvertedFile>,
+    partial_failure: bool,
+    error_message: Option<String>,
+) -> ConvertSummary {
     let total_records = results.iter().map(|item| item.records).sum();
     ConvertSummary {
         files: results
@@ -500,17 +709,28 @@ fn summary_from_results(results: Vec<ConvertedFile>) -> ConvertSummary {
             })
             .collect(),
         total_records,
+        partial_failure,
+        error_message,
     }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .manage(Arc::new(ReferenceStore::new()))
+        .setup(|app| {
+            let cache_dir = reference_cache_dir(app.handle());
+            app.manage(Arc::new(ReferenceStore::new(cache_dir)));
+            app.manage(Arc::new(JobManager::new()));
+            Ok(())
+        })
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             get_supported_formats,
+            suggest_output_format_for_paths,
+            run_preflight_check,
+            run_fastq_qc,
+            cancel_job,
             get_default_browse_root,
             load_user_preferences,
             save_user_preferences,

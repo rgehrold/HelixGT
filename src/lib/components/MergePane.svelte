@@ -1,7 +1,16 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
   import { open } from "@tauri-apps/plugin-dialog";
-  import type { LogLevel, MergeSuggestion, MergeSummary, MergeValidation } from "$lib/types";
+  import { openPath } from "@tauri-apps/plugin-opener";
+  import { onMount } from "svelte";
+  import {
+    cancelJob,
+    onMergeProgress,
+    runMerge as invokeMerge,
+    runPreflightCheck,
+    suggestMergedFilename,
+    validateMergePaths,
+  } from "$lib/api";
+  import type { LogLevel, MergeProgress, MergeSuggestion, MergeSummary, MergeValidation } from "$lib/types";
 
   interface Props {
     selectedPaths: string[];
@@ -29,6 +38,19 @@
   let suggestion = $state<MergeSuggestion | null>(null);
   let isMerging = $state(false);
   let lastSummary = $state<MergeSummary | null>(null);
+  let mergeProgress = $state<MergeProgress | null>(null);
+  let currentJobId = $state<string | null>(null);
+  let referencePath = $state("");
+
+  onMount(() => {
+    let unlisten: (() => void) | undefined;
+    void onMergeProgress((payload) => {
+      mergeProgress = payload;
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
+  });
 
   $effect(() => {
     void refreshMergeState(selectedPaths);
@@ -43,8 +65,8 @@
       return;
     }
 
-    validation = await invoke<MergeValidation>("validate_merge_paths", { paths });
-    suggestion = await invoke<MergeSuggestion>("suggest_merged_filename", { paths });
+    validation = await validateMergePaths(paths);
+    suggestion = await suggestMergedFilename(paths);
     if (!outputName.trim() || suggestion.similar) {
       outputName = suggestion.suggestedName;
     }
@@ -78,18 +100,32 @@
       return;
     }
 
+    const preflight = await runPreflightCheck({
+      mode: "merge",
+      inputPaths: selectedPaths,
+      outputDir: outputDir.trim(),
+      referencePath: validation?.format === "cram" ? referencePath.trim() || null : null,
+    });
+    if (!preflight.ok) {
+      onLog(preflight.issues.map((issue) => issue.message).join("\n"), "error");
+      return;
+    }
+
     isMerging = true;
+    mergeProgress = null;
     onBusyChange?.(true);
+    currentJobId = `merge-${Date.now()}`;
     onLog(`Merging ${selectedPaths.length} file(s)…`);
 
     try {
-      const summary = await invoke<MergeSummary>("run_merge", {
-        request: {
-          inputPaths: selectedPaths,
-          outputDir: outputDir.trim(),
-          outputName: outputName.trim(),
-          compress,
-        },
+      const summary = await invokeMerge({
+        inputPaths: selectedPaths,
+        outputDir: outputDir.trim(),
+        outputName: outputName.trim(),
+        compress,
+        referencePath:
+          validation?.format === "cram" ? referencePath.trim() || null : null,
+        jobId: currentJobId,
       });
       lastSummary = summary;
       onLog(
@@ -100,8 +136,25 @@
       onLog(`Merge error: ${String(error)}`, "error");
     } finally {
       isMerging = false;
+      mergeProgress = null;
+      currentJobId = null;
       onBusyChange?.(false);
     }
+  }
+
+  async function cancelMerge() {
+    if (!currentJobId) return;
+    await cancelJob(currentJobId);
+    onLog("Merge cancelled.", "warn");
+  }
+
+  async function openOutputFolder() {
+    if (!lastSummary?.outputPath) return;
+    const slash = Math.max(
+      lastSummary.outputPath.lastIndexOf("\\"),
+      lastSummary.outputPath.lastIndexOf("/"),
+    );
+    if (slash > 0) await openPath(lastSummary.outputPath.slice(0, slash));
   }
 </script>
 
@@ -157,14 +210,31 @@
     <span>Gzip compress output (.gz)</span>
   </label>
 
-  <button class="primary" onclick={runMerge} disabled={disabled || isMerging || !validation?.isValid}>
-    {isMerging ? "Merging…" : "Run merge"}
-  </button>
+  {#if validation?.format === "cram"}
+    <label class="field">
+      <span>Reference FASTA (required for CRAM merge)</span>
+      <input bind:value={referencePath} placeholder="C:\path\to\reference.fasta" disabled={disabled || isMerging} />
+    </label>
+  {/if}
+
+  <div class="row actions">
+    <button class="primary" onclick={runMerge} disabled={disabled || isMerging || !validation?.isValid}>
+      {isMerging ? "Merging…" : "Run merge"}
+    </button>
+    {#if isMerging}
+      <button class="ghost" onclick={cancelMerge}>Cancel</button>
+    {/if}
+  </div>
+
+  {#if mergeProgress}
+    <p class="progress-label">{mergeProgress.message}</p>
+  {/if}
 
   {#if lastSummary}
     <div class="success">
       <strong>Merge complete</strong>
       <p>{lastSummary.inputCount} inputs · {lastSummary.records.toLocaleString()} records</p>
+      <button class="ghost" onclick={openOutputFolder}>Open output folder</button>
     </div>
   {/if}
 </div>
