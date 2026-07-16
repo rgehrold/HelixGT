@@ -13,6 +13,7 @@
     onchange?: (paths: string[]) => void;
     onSetOutputFolder?: (path: string) => void;
     onSetAsReference?: (path: string) => void;
+    onOpenInView?: (path: string) => void;
   }
 
   let {
@@ -22,6 +23,7 @@
     onchange,
     onSetOutputFolder,
     onSetAsReference,
+    onOpenInView,
   }: Props = $props();
 
   let rootPath = $state("");
@@ -280,6 +282,10 @@
 
   function isFastaPath(path: string) {
     return /\.(fasta|fa|fna|ffn)(\.gz)?$/i.test(path);
+  }
+
+  function isViewableSequencePath(path: string) {
+    return /\.(fasta|fa|fna|ffn|frn|fastq|fq|gff|gff3|bed|bam|cram)(\.gz)?$/i.test(path);
   }
 
   async function toggleCheck(entry: DirEntry) {
@@ -663,9 +669,9 @@
   onclick={closeContextMenu}
 >
   <div class="toolbar">
-    <button class="ghost" onclick={goUp} disabled={disabled || !rootPath}>↑ Up</button>
+    <button class="ghost compact" onclick={goUp} disabled={disabled || !rootPath} title="Up">↑</button>
     <button
-      class="ghost icon-btn"
+      class="ghost compact icon-btn"
       onclick={() => void refreshCurrentView()}
       disabled={disabled}
       title="Refresh"
@@ -673,11 +679,11 @@
     >
       ↻
     </button>
-    <button class="ghost" onclick={changeRoot} disabled={disabled}>Change root</button>
-    <button class="ghost" onclick={clearSelection} disabled={disabled || selectedCount === 0}>
-      Clear selection
+    <button class="ghost compact" onclick={changeRoot} disabled={disabled} title="Change root folder">Root…</button>
+    <button class="ghost compact" onclick={clearSelection} disabled={disabled || selectedCount === 0} title="Clear selection">
+      Clear
     </button>
-    <span class="selection-count">{selectedCount} file{selectedCount === 1 ? "" : "s"} selected</span>
+    <span class="selection-count">{selectedCount} sel.</span>
   </div>
 
   {#if errorMessage}
@@ -827,6 +833,19 @@
       >
         Open in Explorer
       </button>
+      {#if !contextMenu.isDir && isViewableSequencePath(contextMenu.path)}
+        <button
+          class="context-item"
+          disabled={disabled}
+          onclick={() => {
+            const path = contextMenu!.path;
+            closeContextMenu();
+            onOpenInView?.(path);
+          }}
+        >
+          Open in View
+        </button>
+      {/if}
       <button
         class="context-item"
         disabled={disabled}
@@ -862,7 +881,7 @@
   .explorer {
     display: flex;
     flex-direction: column;
-    gap: 10px;
+    gap: 6px;
     min-height: 0;
     flex: 1;
     overflow: hidden;
@@ -871,7 +890,7 @@
   .toolbar {
     display: flex;
     flex-wrap: wrap;
-    gap: 8px;
+    gap: 4px;
     align-items: center;
     flex-shrink: 0;
   }
@@ -879,15 +898,37 @@
   .selection-count {
     margin-left: auto;
     color: var(--accent-highlight);
-    font-size: 0.86rem;
+    font-size: 0.72rem;
     font-weight: 600;
   }
 
   .icon-btn {
-    min-width: 38px;
-    padding-inline: 10px;
-    font-size: 1.05rem;
+    min-width: 28px;
+    padding-inline: 6px;
+    font-size: 0.95rem;
     line-height: 1;
+  }
+
+  .ghost {
+    cursor: pointer;
+    border: 1px solid var(--chip-border);
+    background: var(--chip-bg);
+    color: var(--text-primary);
+    padding: 5px 10px;
+    border-radius: 8px;
+    font: inherit;
+    font-size: 0.76rem;
+    font-weight: 600;
+  }
+
+  .ghost.compact {
+    padding: 3px 8px;
+    font-size: 0.74rem;
+  }
+
+  .ghost:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
   }
 
   .explorer-error {
@@ -903,7 +944,7 @@
     min-height: 0;
     flex: 1;
     border: 1px solid var(--panel-border);
-    border-radius: 14px;
+    border-radius: 10px;
     overflow: hidden;
     background: var(--tree-bg);
   }
@@ -911,16 +952,16 @@
   .tree-header,
   .tree-row {
     display: grid;
-    grid-template-columns: 34px 38px minmax(240px, 1fr);
-    gap: 6px;
+    grid-template-columns: 28px 28px minmax(180px, 1fr);
+    gap: 4px;
     align-items: center;
   }
 
   .tree-header {
-    padding: 8px 12px;
+    padding: 4px 8px;
     border-bottom: 1px solid var(--tree-header-border);
     color: var(--text-muted);
-    font-size: 0.82rem;
+    font-size: 0.74rem;
     flex-shrink: 0;
   }
 
@@ -976,8 +1017,9 @@
   }
 
   .tree-row {
-    padding: 1px 12px 1px calc(12px + var(--depth) * 16px);
+    padding: 0 8px 0 calc(6px + var(--depth) * 12px);
     min-width: max-content;
+    font-size: 0.8rem;
   }
 
   .tree-row.focused {

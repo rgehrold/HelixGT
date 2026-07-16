@@ -11,9 +11,11 @@ use noodles::sam;
 
 
 
+use noodles::bam;
+use noodles::cram;
+
 use crate::cancel::CancelToken;
 use crate::convert::{finish_gzip_writer, open_buf_reader, open_buf_writer, open_text_writer};
-use crate::external::{samtools_merge, samtools_view_count};
 use crate::format::{infer_format, is_gzipped, FileFormat};
 use crate::preflight::check_cancel;
 use crate::tools::ToolPaths;
@@ -191,8 +193,8 @@ pub fn merge_files(
         FileFormat::Sam => {
             merge_sam(input_paths, &output_path, compress, options, &mut on_progress)?
         }
-        FileFormat::Bam => merge_bam_samtools(input_paths, &output_path, options, &mut on_progress)?,
-        FileFormat::Cram => merge_cram_samtools(input_paths, &output_path, options, &mut on_progress)?,
+        FileFormat::Bam => merge_bam(input_paths, &output_path, options, &mut on_progress)?,
+        FileFormat::Cram => merge_cram(input_paths, &output_path, options, &mut on_progress)?,
         FileFormat::Gff | FileFormat::Bed | FileFormat::Vcf | FileFormat::GenBank => {
             merge_text_lines(input_paths, &output_path, compress, format, options, &mut on_progress)?
         }
@@ -358,40 +360,108 @@ fn merge_sam(
     Ok(count)
 }
 
-fn merge_bam_samtools(
+fn merge_bam(
     paths: &[PathBuf],
     output_path: &Path,
     options: &MergeOptions,
     on_progress: &mut Option<&mut dyn FnMut(u64, &str)>,
 ) -> Result<u64> {
-    let samtools = options
-        .tool_paths
-        .resolve_samtools()
-        .context("samtools is required to merge BAM files")?;
-    emit_progress(on_progress, 0, "merging BAM files with samtools");
-    samtools_merge(&samtools, output_path, paths, None)?;
-    let count = samtools_view_count(&samtools, output_path, &[])?;
+    let out_file = File::create(output_path)
+        .with_context(|| format!("failed to create BAM '{}'", output_path.display()))?;
+    let mut writer = bam::io::Writer::new(out_file);
+    let mut count = 0u64;
+
+    for (file_index, input_path) in paths.iter().enumerate() {
+        check_cancel(options.cancel.as_ref())?;
+        let file = File::open(input_path)
+            .with_context(|| format!("failed to open BAM '{}'", input_path.display()))?;
+        let mut reader = bam::io::Reader::new(file);
+        let header = reader
+            .read_header()
+            .with_context(|| format!("failed to read BAM header in '{}'", input_path.display()))?;
+
+        if file_index == 0 {
+            writer
+                .write_header(&header)
+                .context("failed to write merged BAM header")?;
+        }
+
+        for (index, result) in reader.records().enumerate() {
+            check_cancel(options.cancel.as_ref())?;
+            let record = result.with_context(|| {
+                format!(
+                    "invalid BAM record #{} in '{}'",
+                    index + 1,
+                    input_path.display()
+                )
+            })?;
+            writer.write_record(&header, &record).with_context(|| {
+                format!(
+                    "failed to write BAM record #{} from '{}'",
+                    index + 1,
+                    input_path.display()
+                )
+            })?;
+            count += 1;
+            if count % 1000 == 0 {
+                emit_progress(on_progress, count, &format!("merged {count} BAM records"));
+            }
+        }
+    }
+
     emit_progress(on_progress, count, &format!("merged {count} BAM records"));
     Ok(count)
 }
 
-fn merge_cram_samtools(
+fn merge_cram(
     paths: &[PathBuf],
     output_path: &Path,
     options: &MergeOptions,
     on_progress: &mut Option<&mut dyn FnMut(u64, &str)>,
 ) -> Result<u64> {
-    let samtools = options
-        .tool_paths
-        .resolve_samtools()
-        .context("samtools is required to merge CRAM files")?;
-    let reference = options
-        .reference_path
-        .as_deref()
-        .context("CRAM merge requires a reference FASTA")?;
-    emit_progress(on_progress, 0, "merging CRAM files with samtools");
-    samtools_merge(&samtools, output_path, paths, Some(reference))?;
-    let count = samtools_view_count(&samtools, output_path, &[])?;
+    let out_file = File::create(output_path)
+        .with_context(|| format!("failed to create CRAM '{}'", output_path.display()))?;
+    let mut writer = cram::io::Writer::new(out_file);
+    let mut count = 0u64;
+
+    for (file_index, input_path) in paths.iter().enumerate() {
+        check_cancel(options.cancel.as_ref())?;
+        let file = File::open(input_path)
+            .with_context(|| format!("failed to open CRAM '{}'", input_path.display()))?;
+        let mut reader = cram::io::Reader::new(file);
+        let header = reader
+            .read_header()
+            .with_context(|| format!("failed to read CRAM header in '{}'", input_path.display()))?;
+
+        if file_index == 0 {
+            writer
+                .write_header(&header)
+                .context("failed to write merged CRAM header")?;
+        }
+
+        for (index, result) in reader.records(&header).enumerate() {
+            check_cancel(options.cancel.as_ref())?;
+            let record = result.with_context(|| {
+                format!(
+                    "invalid CRAM record #{} in '{}'",
+                    index + 1,
+                    input_path.display()
+                )
+            })?;
+            writer.write_record(&header, record).with_context(|| {
+                format!(
+                    "failed to write CRAM record #{} from '{}'",
+                    index + 1,
+                    input_path.display()
+                )
+            })?;
+            count += 1;
+            if count % 1000 == 0 {
+                emit_progress(on_progress, count, &format!("merged {count} CRAM records"));
+            }
+        }
+    }
+
     emit_progress(on_progress, count, &format!("merged {count} CRAM records"));
     Ok(count)
 }

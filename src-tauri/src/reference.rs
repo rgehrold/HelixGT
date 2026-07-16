@@ -87,9 +87,11 @@ impl ReferenceStore {
         Self::load_manifest(&cache_root, &mut entries);
         Self {
             client: Client::builder()
-                .user_agent("HelixGT/0.2")
+                .user_agent("HelixGT/0.2 (https://github.com/helixgt; genomics desktop app)")
                 .timeout(Duration::from_secs(3600))
                 .connect_timeout(Duration::from_secs(60))
+                .pool_idle_timeout(Duration::from_secs(90))
+                .tcp_keepalive(Duration::from_secs(30))
                 .build()
                 .expect("failed to build HTTP client"),
             entries: Mutex::new(entries),
@@ -129,9 +131,16 @@ impl ReferenceStore {
         }
     }
 
-    fn persist_manifest(&self) -> Result<(), String> {
-        let entries = self.entries.lock().expect("reference cache lock poisoned");
-        let manifest: Vec<CachedReferenceManifestEntry> = entries
+    /// Persist while the caller already holds `entries` (avoids re-entrant lock deadlock).
+    fn persist_manifest_with(
+        cache_root: &Path,
+        entries: &HashMap<String, CachedReference>,
+    ) -> Result<(), String> {
+        Self::write_manifest(cache_root, &Self::manifest_entries(entries))
+    }
+
+    fn manifest_entries(entries: &HashMap<String, CachedReference>) -> Vec<CachedReferenceManifestEntry> {
+        entries
             .iter()
             .map(|(id, entry)| CachedReferenceManifestEntry {
                 id: id.clone(),
@@ -140,10 +149,16 @@ impl ReferenceStore {
                 gzipped: entry.gzipped,
                 sequence_bytes: entry.sequence_bytes,
             })
-            .collect();
-        let json = serde_json::to_string_pretty(&manifest)
+            .collect()
+    }
+
+    fn write_manifest(
+        cache_root: &Path,
+        manifest: &[CachedReferenceManifestEntry],
+    ) -> Result<(), String> {
+        let json = serde_json::to_string_pretty(manifest)
             .map_err(|error| format!("failed to serialize reference manifest: {error}"))?;
-        fs::write(Self::manifest_path(&self.cache_root), json)
+        fs::write(Self::manifest_path(cache_root), json)
             .map_err(|error| format!("failed to write reference manifest: {error}"))?;
         Ok(())
     }
@@ -186,26 +201,32 @@ impl ReferenceStore {
         let cache_path = self.cache_file_path(id, &reference);
         if cache_path.is_file() {
             let gzipped = is_gzip_file(&cache_path);
-            if let Ok(sequence_bytes) = validate_reference_file(&cache_path, gzipped) {
-                let mut entries = self.entries.lock().expect("reference cache lock poisoned");
-                entries.insert(
-                    id.to_string(),
-                    CachedReference {
-                        label: reference.label.clone(),
-                        cache_path: cache_path.clone(),
-                        gzipped,
+            match validate_reference_file(&cache_path, gzipped) {
+                Ok(sequence_bytes) => {
+                    let mut entries = self.entries.lock().expect("reference cache lock poisoned");
+                    entries.insert(
+                        id.to_string(),
+                        CachedReference {
+                            label: reference.label.clone(),
+                            cache_path: cache_path.clone(),
+                            gzipped,
+                            sequence_bytes,
+                        },
+                    );
+                    let _ = Self::persist_manifest_with(&self.cache_root, &entries);
+                    return Ok(ReferenceFetchResult {
+                        id: id.to_string(),
+                        label: reference.label,
+                        size_bytes: cache_path.metadata().map(|m| m.len() as usize).unwrap_or(0),
                         sequence_bytes,
-                    },
-                );
-                let _ = self.persist_manifest();
-                return Ok(ReferenceFetchResult {
-                    id: id.to_string(),
-                    label: reference.label,
-                    size_bytes: cache_path.metadata().map(|m| m.len() as usize).unwrap_or(0),
-                    sequence_bytes,
-                    gzipped,
-                    cached: true,
-                });
+                        gzipped,
+                        cached: true,
+                    });
+                }
+                Err(_) => {
+                    // Corrupt / incomplete cache file — remove and re-download.
+                    let _ = fs::remove_file(&cache_path);
+                }
             }
         }
         fs::create_dir_all(
@@ -215,11 +236,23 @@ impl ReferenceStore {
         )
         .map_err(|error| format!("failed to create cache directory: {error}"))?;
 
+        let _ = app.emit(
+            "reference-download-progress",
+            ReferenceDownloadProgress {
+                id: id.to_string(),
+                downloaded_bytes: 0,
+                total_bytes: None,
+                percent: Some(0.0),
+            },
+        );
+
         self.download_streaming(app, id, &reference.url, &cache_path)?;
 
         let gzipped = is_gzip_file(&cache_path);
-        let sequence_bytes = validate_reference_file(&cache_path, gzipped)
-            .map_err(|error| format!("downloaded reference is not valid FASTA: {error:#}"))?;
+        let sequence_bytes = validate_reference_file(&cache_path, gzipped).map_err(|error| {
+            let _ = fs::remove_file(&cache_path);
+            format!("downloaded reference is not valid FASTA: {error:#}")
+        })?;
 
         let result = ReferenceFetchResult {
             id: id.to_string(),
@@ -230,17 +263,19 @@ impl ReferenceStore {
             cached: false,
         };
 
-        let mut entries = self.entries.lock().expect("reference cache lock poisoned");
-        entries.insert(
-            id.to_string(),
-            CachedReference {
-                label: reference.label,
-                cache_path,
-                gzipped,
-                sequence_bytes,
-            },
-        );
-        self.persist_manifest()?;
+        {
+            let mut entries = self.entries.lock().expect("reference cache lock poisoned");
+            entries.insert(
+                id.to_string(),
+                CachedReference {
+                    label: reference.label,
+                    cache_path,
+                    gzipped,
+                    sequence_bytes,
+                },
+            );
+            Self::persist_manifest_with(&self.cache_root, &entries)?;
+        }
 
         Ok(result)
     }
@@ -270,17 +305,19 @@ impl ReferenceStore {
             cached: false,
         };
 
-        let mut entries = self.entries.lock().expect("reference cache lock poisoned");
-        entries.insert(
-            id.to_string(),
-            CachedReference {
-                label,
-                cache_path: source,
-                gzipped,
-                sequence_bytes,
-            },
-        );
-        self.persist_manifest()?;
+        {
+            let mut entries = self.entries.lock().expect("reference cache lock poisoned");
+            entries.insert(
+                id.to_string(),
+                CachedReference {
+                    label,
+                    cache_path: source,
+                    gzipped,
+                    sequence_bytes,
+                },
+            );
+            Self::persist_manifest_with(&self.cache_root, &entries)?;
+        }
 
         Ok(result)
     }
@@ -359,7 +396,7 @@ impl ReferenceStore {
                 }
             }
         }
-        let _ = self.persist_manifest();
+        let _ = Self::persist_manifest_with(&self.cache_root, &entries);
     }
 
     fn result_from_entry(id: &str, entry: &CachedReference, cached: bool) -> ReferenceFetchResult {
@@ -453,6 +490,18 @@ impl ReferenceStore {
             .map_err(|error| format!("network error: {error}"))?;
 
         let status = response.status();
+        // 416 = range not satisfiable (file already complete or corrupt offset).
+        // Restart from scratch instead of failing the whole download.
+        if status.as_u16() == 416 {
+            let _ = fs::remove_file(dest);
+            let response = self
+                .client
+                .get(url)
+                .send()
+                .map_err(|error| format!("network error: {error}"))?;
+            return self.write_response_body(app, id, response, dest, 0, false);
+        }
+
         if !status.is_success() && status.as_u16() != 206 {
             return Err(format!("download failed with status {status}"));
         }
@@ -462,6 +511,19 @@ impl ReferenceStore {
             downloaded = 0;
             let _ = fs::remove_file(dest);
         }
+
+        self.write_response_body(app, id, response, dest, downloaded, resume_ok)
+    }
+
+    fn write_response_body(
+        &self,
+        app: &AppHandle,
+        id: &str,
+        response: reqwest::blocking::Response,
+        dest: &Path,
+        mut downloaded: u64,
+        resume_ok: bool,
+    ) -> Result<(), String> {
 
         let total_bytes = if resume_ok {
             response
@@ -564,7 +626,16 @@ impl ReferenceStore {
             }
         });
 
-        let output = std::process::Command::new("curl")
+        // Prefer curl.exe on Windows so we don't hit PowerShell's Invoke-WebRequest alias.
+        let curl_program = if cfg!(windows) { "curl.exe" } else { "curl" };
+        let mut command = std::process::Command::new(curl_program);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let output = command
             .args([
                 "-L",
                 "--fail",
@@ -572,20 +643,28 @@ impl ReferenceStore {
                 "5",
                 "--retry-delay",
                 "2",
-                "-C",
-                "-",
+                "--connect-timeout",
+                "30",
                 "-o",
                 dest_str,
                 url,
             ])
             .output()
-            .map_err(|error| format!("failed to run curl: {error}"))?;
+            .map_err(|error| format!("failed to run {curl_program}: {error}"))?;
 
         stop_progress.store(true, Ordering::Relaxed);
         let _ = progress_handle.join();
 
         if !output.status.success() {
-            return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            return Err(if !stderr.is_empty() {
+                stderr
+            } else if !stdout.is_empty() {
+                stdout
+            } else {
+                format!("{curl_program} failed with status {:?}", output.status.code())
+            });
         }
         Ok(())
     }

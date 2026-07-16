@@ -8,12 +8,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use converter_core::{
-    align_reads_to_reference, batch_convert, fastq_qc, is_compatible_file, merge_files,
+    align_reads_to_reference, batch_convert, fastq_qc, get_coverage_bins, get_features_in_range,
+    get_reads_in_range_filtered, get_sequence_window, is_compatible_file, merge_files,
+    open_alignment_document, open_annotation_document, open_sequence_document,
     output_alignment_path, resolve_minimap2_path, resolve_samtools_path, run_preflight,
     suggest_merge_filename, suggest_output_format, validate_merge_inputs, AlignOptions,
-    AlignOutputFormat, ConvertOptions, ConvertedFile, FastqQcSummary, FileFormat, MergeOptions,
-    Minimap2Options, Minimap2Preset, PreflightMode, PreflightReport, PreflightRequest, ToolLogSink,
-    ToolPaths,
+    AlignOutputFormat, AlignmentDocument, AnnotationDocument, ConvertOptions, ConvertedFile,
+    CoverageWindow, FastqQcSummary, FeatureWindow, FileFormat, MergeOptions, Minimap2Options,
+    Minimap2Preset, PreflightMode, PreflightReport, PreflightRequest, ReadQueryOptions, ReadsWindow,
+    SequenceDocument, SequenceSlice, ToolLogSink, ToolPaths,
 };
 use jobs::JobManager;
 
@@ -277,6 +280,177 @@ fn to_preflight_response(report: PreflightReport) -> PreflightResponse {
 #[tauri::command]
 fn run_fastq_qc(path: String) -> Result<FastqQcSummary, String> {
     fastq_qc(PathBuf::from(path).as_path()).map_err(|error| format!("{error:#}"))
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SequenceWindowRequest {
+    path: String,
+    contig: String,
+    start: u64,
+    end: u64,
+    reverse_complement: Option<bool>,
+}
+
+/// View I/O is heavy (FASTA cache, BAM index queries). Always run off the async
+/// runtime so the UI thread stays responsive — same pattern as convert/align.
+#[tauri::command]
+async fn view_open_document(path: String) -> Result<SequenceDocument, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        open_sequence_document(PathBuf::from(path).as_path()).map_err(|error| format!("{error:#}"))
+    })
+    .await
+    .map_err(|error| format!("view open task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn view_get_sequence_window(request: SequenceWindowRequest) -> Result<SequenceSlice, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        get_sequence_window(
+            PathBuf::from(request.path).as_path(),
+            &request.contig,
+            request.start,
+            request.end,
+            request.reverse_complement.unwrap_or(false),
+        )
+        .map_err(|error| format!("{error:#}"))
+    })
+    .await
+    .map_err(|error| format!("sequence window task failed: {error}"))?
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FeatureWindowRequest {
+    path: String,
+    contig: String,
+    start: u64,
+    end: u64,
+}
+
+#[tauri::command]
+async fn view_open_annotation(path: String) -> Result<AnnotationDocument, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        open_annotation_document(PathBuf::from(path).as_path()).map_err(|error| format!("{error:#}"))
+    })
+    .await
+    .map_err(|error| format!("annotation open task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn view_get_features_in_range(request: FeatureWindowRequest) -> Result<FeatureWindow, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        get_features_in_range(
+            PathBuf::from(request.path).as_path(),
+            &request.contig,
+            request.start,
+            request.end,
+        )
+        .map_err(|error| format!("{error:#}"))
+    })
+    .await
+    .map_err(|error| format!("feature window task failed: {error}"))?
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AlignmentOpenRequest {
+    path: String,
+    reference_path: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CoverageWindowRequest {
+    path: String,
+    contig: String,
+    start: u64,
+    end: u64,
+    bin_count: Option<usize>,
+    reference_path: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReadsWindowRequest {
+    path: String,
+    contig: String,
+    start: u64,
+    end: u64,
+    reference_path: Option<String>,
+    include_secondary: Option<bool>,
+    include_supplementary: Option<bool>,
+    include_duplicates: Option<bool>,
+    min_mapq: Option<u8>,
+    include_sequences: Option<bool>,
+}
+
+#[tauri::command]
+async fn view_open_alignment(
+    app: AppHandle,
+    request: AlignmentOpenRequest,
+) -> Result<AlignmentDocument, String> {
+    let tools = tool_paths_for_app(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        open_alignment_document(
+            PathBuf::from(request.path).as_path(),
+            &tools,
+            request.reference_path.as_deref().map(PathBuf::from).as_deref(),
+        )
+        .map_err(|error| format!("{error:#}"))
+    })
+    .await
+    .map_err(|error| format!("alignment open task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn view_get_coverage_bins(
+    app: AppHandle,
+    request: CoverageWindowRequest,
+) -> Result<CoverageWindow, String> {
+    let tools = tool_paths_for_app(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        get_coverage_bins(
+            PathBuf::from(request.path).as_path(),
+            &tools,
+            &request.contig,
+            request.start,
+            request.end,
+            request.bin_count.unwrap_or(200),
+            request.reference_path.as_deref().map(PathBuf::from).as_deref(),
+        )
+        .map_err(|error| format!("{error:#}"))
+    })
+    .await
+    .map_err(|error| format!("coverage task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn view_get_reads_in_range(
+    app: AppHandle,
+    request: ReadsWindowRequest,
+) -> Result<ReadsWindow, String> {
+    let tools = tool_paths_for_app(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        get_reads_in_range_filtered(
+            PathBuf::from(request.path).as_path(),
+            &tools,
+            &request.contig,
+            request.start,
+            request.end,
+            request.reference_path.as_deref().map(PathBuf::from).as_deref(),
+            &ReadQueryOptions {
+                include_secondary: request.include_secondary.unwrap_or(false),
+                include_supplementary: request.include_supplementary.unwrap_or(false),
+                include_duplicates: request.include_duplicates.unwrap_or(false),
+                min_mapq: request.min_mapq.unwrap_or(0),
+                include_sequences: request.include_sequences.unwrap_or(true),
+            },
+        )
+        .map_err(|error| format!("{error:#}"))
+    })
+    .await
+    .map_err(|error| format!("reads task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -754,7 +928,14 @@ pub fn run() {
             save_reference,
             minimap2_is_available,
             samtools_is_available,
-            run_alignment
+            run_alignment,
+            view_open_document,
+            view_get_sequence_window,
+            view_open_annotation,
+            view_get_features_in_range,
+            view_open_alignment,
+            view_get_coverage_bins,
+            view_get_reads_in_range
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

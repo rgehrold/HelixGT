@@ -69,3 +69,5 @@ helixgt-user.json
 # External tool source trees (runtime binaries in binaries/ are tracked)
 src-tauri/binaries/minimap2-*/
 src-tauri/binaries/samtools-*/
+
+AGENTS.md

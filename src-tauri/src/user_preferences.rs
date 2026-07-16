@@ -18,6 +18,8 @@ pub struct UserPreferences {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub files_pane_width: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_pane_collapsed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub active_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub convert_output_dir: Option<String>,
@@ -43,7 +45,8 @@ pub fn default_preferences() -> UserPreferences {
     UserPreferences {
         browse_root: Some(default_browse_root().display().to_string()),
         expanded_dirs: None,
-        files_pane_width: Some(58.0),
+        files_pane_width: Some(28.0),
+        files_pane_collapsed: Some(false),
         active_mode: Some("convert".into()),
         convert_output_dir: None,
         merge_output_dir: None,
@@ -71,7 +74,7 @@ fn is_valid_directory(path: &str) -> bool {
 
 fn sanitize(mut prefs: UserPreferences) -> UserPreferences {
     if let Some(width) = prefs.files_pane_width {
-        prefs.files_pane_width = Some(width.clamp(32.0, 78.0));
+        prefs.files_pane_width = Some(width.clamp(12.0, 85.0));
     }
 
     if let Some(root) = prefs.browse_root.as_ref() {
@@ -125,6 +128,7 @@ pub fn load_user_preferences(app: &AppHandle) -> UserPreferences {
         browse_root: parsed.browse_root.or(defaults.browse_root),
         expanded_dirs: parsed.expanded_dirs,
         files_pane_width: parsed.files_pane_width.or(defaults.files_pane_width),
+        files_pane_collapsed: parsed.files_pane_collapsed.or(defaults.files_pane_collapsed),
         active_mode: parsed.active_mode.or(defaults.active_mode),
         convert_output_dir: parsed.convert_output_dir,
         merge_output_dir: parsed.merge_output_dir,
@@ -151,6 +155,7 @@ pub fn save_user_preferences(app: &AppHandle, prefs: UserPreferences) -> Result<
         browse_root: prefs.browse_root.or(existing.browse_root),
         expanded_dirs: prefs.expanded_dirs.or(existing.expanded_dirs),
         files_pane_width: prefs.files_pane_width.or(existing.files_pane_width),
+        files_pane_collapsed: prefs.files_pane_collapsed.or(existing.files_pane_collapsed),
         active_mode: prefs.active_mode.or(existing.active_mode),
         convert_output_dir: prefs.convert_output_dir.or(existing.convert_output_dir),
         merge_output_dir: prefs.merge_output_dir.or(existing.merge_output_dir),

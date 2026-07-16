@@ -5,13 +5,21 @@
 
   import { onMount } from "svelte";
   import AlignPane from "$lib/components/AlignPane.svelte";
+  import AnalyzePane from "$lib/components/AnalyzePane.svelte";
   import ConvertPane from "$lib/components/ConvertPane.svelte";
   import FileExplorer from "$lib/components/FileExplorer.svelte";
   import MergePane from "$lib/components/MergePane.svelte";
+  import LogsPanel from "$lib/components/LogsPanel.svelte";
+  import ManualPanel from "$lib/components/ManualPanel.svelte";
   import MenuBar from "$lib/components/MenuBar.svelte";
+  import ViewPane from "$lib/components/ViewPane.svelte";
   import { appendLog } from "$lib/log";
   import { getSupportedFormats } from "$lib/api";
-  import { clampFilesPaneWidth } from "$lib/layout";
+  import {
+    clampFilesPaneWidth,
+    DEFAULT_EXPANDED_FILES_PANE_PERCENT,
+    shouldSnapCollapseFilesPane,
+  } from "$lib/layout";
   import {
     defaultFilesPaneWidth,
     loadUserPreferences,
@@ -43,7 +51,7 @@
   let isDragging = $state(false);
   let logs = $state<LogEntry[]>([]);
   let toolLogs = $state<LogEntry[]>([]);
-  let logTab = $state<"activity" | "tools">("activity");
+  let logsOpen = $state(false);
   let fileExplorer = $state<{
     revealPaths: (paths: string[]) => Promise<void>;
     refreshTree: () => Promise<void>;
@@ -51,25 +59,36 @@
   let alignPane = $state<{
     loadReferenceFromPath: (path: string) => Promise<void>;
   } | null>(null);
-  let filesPaneWidth = $state(58);
+  let filesPaneWidth = $state(defaultFilesPaneWidth());
+  let filesPaneCollapsed = $state(false);
+  let filesPaneWidthBeforeCollapse = $state(defaultFilesPaneWidth());
   let isResizing = $state(false);
-  let logEl = $state<HTMLDivElement | null>(null);
   let activeMode = $state<ToolMode>("convert");
   let isMerging = $state(false);
   let isAligning = $state(false);
   let isBusy = $derived(isConverting || isMerging || isAligning);
-
-  $effect(() => {
-    if (isAligning) logTab = "tools";
-  });
+  let viewOpenPath = $state<string | null>(null);
 
   const selectedHasCram = $derived(selectedPaths.some((path) => /\.cram$/i.test(path)));
+
+  const modeMeta: Record<ToolMode, { title: string }> = {
+    convert: { title: "Convert" },
+    merge: { title: "Merge" },
+    align: { title: "Align" },
+    view: { title: "View" },
+    analyze: { title: "File analysis" },
+  };
 
   const needsReferenceForConvert = $derived(
     activeMode === "convert" && (outputFormat === "cram" || selectedHasCram),
   );
 
-  const showSetAsReference = $derived(activeMode === "align" || needsReferenceForConvert);
+  const showSetAsReference = $derived(
+    activeMode === "align" ||
+      activeMode === "view" ||
+      activeMode === "analyze" ||
+      needsReferenceForConvert,
+  );
 
   $effect(() => {
     rememberMode(activeMode);
@@ -79,13 +98,14 @@
     if (outputDir.trim()) rememberOutputDir(activeMode, outputDir);
   });
 
+  // Open logs automatically when a new error arrives during a job.
+  let lastErrorLen = 0;
   $effect(() => {
-    logs;
-    toolLogs;
-    logTab;
-    if (logEl) {
-      logEl.scrollTop = logEl.scrollHeight;
+    const errors = logs.filter((e) => e.level === "error").length;
+    if (errors > lastErrorLen && isBusy) {
+      logsOpen = true;
     }
+    lastErrorLen = errors;
   });
 
   onMount(() => {
@@ -99,6 +119,10 @@
         const prefs = await loadUserPreferences();
         if (typeof prefs.filesPaneWidth === "number") {
           filesPaneWidth = prefs.filesPaneWidth;
+          filesPaneWidthBeforeCollapse = prefs.filesPaneWidth;
+        }
+        if (typeof prefs.filesPaneCollapsed === "boolean") {
+          filesPaneCollapsed = prefs.filesPaneCollapsed;
         }
         if (prefs.activeMode) activeMode = prefs.activeMode;
         if (prefs.outputFormat) outputFormat = prefs.outputFormat;
@@ -146,6 +170,18 @@
     toolLogs = appendLog(toolLogs, message, level);
   }
 
+  function clearActivityLogs() {
+    logs = [];
+  }
+
+  function clearToolLogs() {
+    toolLogs = [];
+  }
+
+  function toggleLogs() {
+    logsOpen = !logsOpen;
+  }
+
   function alignmentIndexPath(outputPath: string): string | null {
     if (outputPath.endsWith(".bam")) return `${outputPath}.bai`;
     if (outputPath.endsWith(".cram")) return `${outputPath}.crai`;
@@ -162,27 +198,58 @@
   }
 
   async function setReferenceFromBrowser(path: string) {
-    if (activeMode === "convert") {
-      referencePath = path;
-      pushLog(`Reference set to ${path}`);
-      return;
-    }
     if (activeMode === "align") {
       await alignPane?.loadReferenceFromPath(path);
+      return;
+    }
+    // Convert, View, and File analysis share the CRAM reference FASTA path.
+    if (activeMode === "convert" || activeMode === "view" || activeMode === "analyze") {
+      referencePath = path;
+      pushLog(`Reference set to ${path}`);
     }
   }
 
   function restoreStandardView() {
+    filesPaneCollapsed = false;
     filesPaneWidth = defaultFilesPaneWidth();
-    patchUserPreferences({ filesPaneWidth: filesPaneWidth });
+    filesPaneWidthBeforeCollapse = filesPaneWidth;
+    patchUserPreferences({
+      filesPaneWidth: filesPaneWidth,
+      filesPaneCollapsed: false,
+    });
     activeMode = "convert";
-    logTab = "activity";
+    logsOpen = false;
     void fileExplorer?.refreshTree();
     pushLog("Restored standard view and refreshed file browser.");
   }
 
+  function collapseFilesPane() {
+    if (!filesPaneCollapsed) {
+      filesPaneWidthBeforeCollapse = filesPaneWidth;
+    }
+    filesPaneCollapsed = true;
+    patchUserPreferences({ filesPaneCollapsed: true, filesPaneWidth: filesPaneWidthBeforeCollapse });
+    saveUserPreferencesNow();
+  }
+
+  function expandFilesPane() {
+    filesPaneCollapsed = false;
+    filesPaneWidth = Math.max(
+      DEFAULT_EXPANDED_FILES_PANE_PERCENT,
+      filesPaneWidthBeforeCollapse || defaultFilesPaneWidth(),
+    );
+    patchUserPreferences({ filesPaneCollapsed: false, filesPaneWidth });
+    saveUserPreferencesNow();
+    queueMicrotask(() => syncPaneWidthToWorkspace(document.querySelector(".workspace")));
+  }
+
+  function toggleFilesPane() {
+    if (filesPaneCollapsed) expandFilesPane();
+    else collapseFilesPane();
+  }
+
   function syncPaneWidthToWorkspace(workspace: Element | null) {
-    if (!workspace) return;
+    if (!workspace || filesPaneCollapsed) return;
     const rect = workspace.getBoundingClientRect();
     const clamped = clampFilesPaneWidth(filesPaneWidth, rect.width);
     if (clamped !== filesPaneWidth) {
@@ -229,17 +296,32 @@
     isResizing = true;
     const workspace = (event.currentTarget as HTMLElement).closest(".workspace");
     if (!workspace) return;
+    let snapCollapse = false;
 
     const onMove = (moveEvent: MouseEvent) => {
       const rect = workspace.getBoundingClientRect();
+      if (shouldSnapCollapseFilesPane(moveEvent.clientX, rect.left)) {
+        snapCollapse = true;
+        filesPaneWidth = clampFilesPaneWidth(
+          (80 / rect.width) * 100,
+          rect.width,
+        );
+        return;
+      }
+      snapCollapse = false;
       const next = ((moveEvent.clientX - rect.left) / rect.width) * 100;
       filesPaneWidth = clampFilesPaneWidth(next, rect.width);
     };
 
     const onUp = () => {
       isResizing = false;
-      patchUserPreferences({ filesPaneWidth });
-      saveUserPreferencesNow();
+      if (snapCollapse) {
+        collapseFilesPane();
+      } else {
+        filesPaneWidthBeforeCollapse = filesPaneWidth;
+        patchUserPreferences({ filesPaneWidth, filesPaneCollapsed: false });
+        saveUserPreferencesNow();
+      }
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
@@ -254,153 +336,212 @@
 
   function switchMode(mode: ToolMode) {
     activeMode = mode;
-    void loadUserPreferences().then((prefs) => {
-      outputDir = outputDirForMode(prefs, mode);
-    });
+    if (mode !== "view") {
+      void loadUserPreferences().then((prefs) => {
+        outputDir = outputDirForMode(prefs, mode);
+      });
+    }
+  }
+
+  function openInView(path: string) {
+    activeMode = "view";
+    viewOpenPath = path;
+    pushLog(`Opening in View: ${path}`);
   }
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div class="app" oncontextmenu={handleAppContextMenu}>
-  <MenuBar onPrint={() => window.print()} onRestoreView={restoreStandardView} />
+  <MenuBar
+    onPrint={() => window.print()}
+    onRestoreView={restoreStandardView}
+    onToggleLogs={toggleLogs}
+    onToggleFilesBrowser={toggleFilesPane}
+    filesBrowserCollapsed={filesPaneCollapsed}
+    {logsOpen}
+  />
 
-  <main class="workspace" class:resizing={isResizing} style={`--files-width:${filesPaneWidth}%`}>
-    <!-- svelte-ignore a11y_no_static_element_interactions -->
-    <section class="panel files-panel" class:dragging={isDragging} ondragover={onDragOver}>
-      <div class="panel-head">
-        <h2>Input browser</h2>
-        <span class="panel-hint">Drop files here · right-click for actions</span>
-      </div>
+  <main
+    class="workspace"
+    class:resizing={isResizing}
+    class:files-collapsed={filesPaneCollapsed}
+    style={`--files-width:${filesPaneWidth}%`}
+  >
+    {#if filesPaneCollapsed}
+      <button
+        type="button"
+        class="files-stash"
+        title="Show input browser"
+        aria-label="Show input browser"
+        onclick={expandFilesPane}
+      >
+        <span class="stash-label">Files</span>
+      </button>
+    {:else}
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <section class="panel files-panel" class:dragging={isDragging} ondragover={onDragOver}>
+        <FileExplorer
+          bind:this={fileExplorer}
+          bind:selectedPaths
+          disabled={isBusy}
+          {showSetAsReference}
+          onSetOutputFolder={(path) => {
+            outputDir = path;
+            pushLog(`Output folder set to ${path}`);
+          }}
+          onSetAsReference={(path) => void setReferenceFromBrowser(path)}
+          onOpenInView={(path) => openInView(path)}
+        />
+      </section>
 
-      <FileExplorer
-        bind:this={fileExplorer}
-        bind:selectedPaths
-        disabled={isBusy}
-        {showSetAsReference}
-        onSetOutputFolder={(path) => {
-          outputDir = path;
-          pushLog(`Output folder set to ${path}`);
-        }}
-        onSetAsReference={(path) => void setReferenceFromBrowser(path)}
-      />
-    </section>
-
-    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-    <div
-      class="resize-handle"
-      role="separator"
-      aria-orientation="vertical"
-      aria-label="Resize panes"
-      onmousedown={startPaneResize}
-    ></div>
+      <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+      <div
+        class="resize-handle"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize panes — drag left to hide browser"
+        title="Drag left to hide browser"
+        onmousedown={startPaneResize}
+      ></div>
+    {/if}
 
     <div class="right-column">
-    <section class="panel settings-panel">
-      <div class="panel-head">
-        <h2>Tools</h2>
-        <div class="mode-tabs">
-          <button class="mode-tab" class:active={activeMode === "convert"} onclick={() => switchMode("convert")}>
-            Convert
+      <section class="panel settings-panel">
+        <nav class="mode-rail" aria-label="Tool modes">
+          <button
+            type="button"
+            class="mode-tab"
+            class:active={activeMode === "convert"}
+            aria-current={activeMode === "convert" ? "page" : undefined}
+            onclick={() => switchMode("convert")}
+          >
+            <span class="mode-tab-title">Convert</span>
           </button>
-          <button class="mode-tab" class:active={activeMode === "merge"} onclick={() => switchMode("merge")}>
-            Merge
+          <button
+            type="button"
+            class="mode-tab"
+            class:active={activeMode === "merge"}
+            aria-current={activeMode === "merge" ? "page" : undefined}
+            onclick={() => switchMode("merge")}
+          >
+            <span class="mode-tab-title">Merge</span>
           </button>
-          <button class="mode-tab" class:active={activeMode === "align"} onclick={() => switchMode("align")}>
-            Align
+          <button
+            type="button"
+            class="mode-tab"
+            class:active={activeMode === "align"}
+            aria-current={activeMode === "align" ? "page" : undefined}
+            onclick={() => switchMode("align")}
+          >
+            <span class="mode-tab-title">Align</span>
           </button>
-        </div>
-      </div>
+          <button
+            type="button"
+            class="mode-tab"
+            class:active={activeMode === "view"}
+            aria-current={activeMode === "view" ? "page" : undefined}
+            onclick={() => switchMode("view")}
+          >
+            <span class="mode-tab-title">View</span>
+          </button>
+          <button
+            type="button"
+            class="mode-tab"
+            class:active={activeMode === "analyze"}
+            aria-current={activeMode === "analyze" ? "page" : undefined}
+            onclick={() => switchMode("analyze")}
+          >
+            <span class="mode-tab-title">Analyze</span>
+          </button>
+        </nav>
 
-      <div class="settings-scroll">
-      {#if activeMode === "convert"}
-        <ConvertPane
-          {formats}
-          {selectedPaths}
-          {outputDir}
-          bind:compress
-          bind:prefix
-          bind:referencePath
-          outputFormat={outputFormat}
-          disabled={isBusy}
-          {samtoolsAvailable}
-          onOutputFormatChange={(value) => {
-            outputFormat = value;
-            patchUserPreferences({ outputFormat: value });
-          }}
-          onOutputDirChange={(value) => (outputDir = value)}
-          onLog={pushLog}
-          onBusyChange={(busy) => (isConverting = busy)}
-          onComplete={async (summary) => {
-            await fileExplorer?.refreshTree();
-            const outputPaths = collectOutputPaths(summary.files.map((file) => file.outputPath));
-            if (outputPaths.length > 0) await fileExplorer?.revealPaths(outputPaths);
-          }}
-        />
-      {:else if activeMode === "merge"}
-        <MergePane
-          {selectedPaths}
-          {outputDir}
-          disabled={isBusy}
-          onOutputDirChange={(value) => (outputDir = value)}
-          onLog={pushLog}
-          onBusyChange={(busy) => (isMerging = busy)}
-          onComplete={async (outputPath) => {
-            await fileExplorer?.refreshTree();
-            await fileExplorer?.revealPaths([outputPath]);
-          }}
-        />
-      {:else}
-        <AlignPane
-          bind:this={alignPane}
-          {selectedPaths}
-          {outputDir}
-          disabled={isBusy}
-          {minimap2Available}
-          {samtoolsAvailable}
-          onOutputDirChange={(value) => (outputDir = value)}
-          onLog={pushLog}
-          onBusyChange={(busy) => (isAligning = busy)}
-          onComplete={async (outputPaths) => {
-            await fileExplorer?.refreshTree();
-            await fileExplorer?.revealPaths(collectOutputPaths(outputPaths));
-          }}
-        />
-      {/if}
-      </div>
-    </section>
-
-    <section class="panel log-panel">
-      <div class="panel-head">
-        <h2>Logs</h2>
-        <div class="log-tabs">
-          <button class="log-tab" class:active={logTab === "activity"} onclick={() => (logTab = "activity")}>
-            Activity
-          </button>
-          <button class="log-tab" class:active={logTab === "tools"} onclick={() => (logTab = "tools")}>
-            Tools
-          </button>
+        <div class="settings-body">
+          <div class="settings-scroll" class:view-scroll={activeMode === "view"}>
+            {#if activeMode === "convert"}
+              <ConvertPane
+                {formats}
+                {selectedPaths}
+                {outputDir}
+                bind:compress
+                bind:prefix
+                bind:referencePath
+                outputFormat={outputFormat}
+                disabled={isBusy}
+                {samtoolsAvailable}
+                onOutputFormatChange={(value) => {
+                  outputFormat = value;
+                  patchUserPreferences({ outputFormat: value });
+                }}
+                onOutputDirChange={(value) => (outputDir = value)}
+                onLog={pushLog}
+                onBusyChange={(busy) => (isConverting = busy)}
+                onComplete={async (summary) => {
+                  await fileExplorer?.refreshTree();
+                  const outputPaths = collectOutputPaths(summary.files.map((file) => file.outputPath));
+                  if (outputPaths.length > 0) await fileExplorer?.revealPaths(outputPaths);
+                }}
+              />
+            {:else if activeMode === "merge"}
+              <MergePane
+                {selectedPaths}
+                {outputDir}
+                disabled={isBusy}
+                onOutputDirChange={(value) => (outputDir = value)}
+                onLog={pushLog}
+                onBusyChange={(busy) => (isMerging = busy)}
+                onComplete={async (outputPath) => {
+                  await fileExplorer?.refreshTree();
+                  await fileExplorer?.revealPaths([outputPath]);
+                }}
+              />
+            {:else if activeMode === "align"}
+              <AlignPane
+                bind:this={alignPane}
+                {selectedPaths}
+                {outputDir}
+                disabled={isBusy}
+                {minimap2Available}
+                {samtoolsAvailable}
+                onOutputDirChange={(value) => (outputDir = value)}
+                onLog={pushLog}
+                onBusyChange={(busy) => (isAligning = busy)}
+                onComplete={async (outputPaths) => {
+                  await fileExplorer?.refreshTree();
+                  await fileExplorer?.revealPaths(collectOutputPaths(outputPaths));
+                }}
+              />
+            {:else if activeMode === "view"}
+              <ViewPane
+                {selectedPaths}
+                openPathRequest={viewOpenPath}
+                bind:referencePath
+                disabled={isBusy}
+                onLog={pushLog}
+                onOpenPathConsumed={() => (viewOpenPath = null)}
+              />
+            {:else}
+              <AnalyzePane
+                {selectedPaths}
+                bind:referencePath
+                disabled={isBusy}
+                onLog={pushLog}
+              />
+            {/if}
+          </div>
         </div>
-      </div>
-      <div class="log" bind:this={logEl}>
-        {#if logTab === "activity"}
-          {#each logs as entry}
-            <div class="log-line" class:log-error={entry.level === "error"} class:log-warn={entry.level === "warn"}>
-              {entry.message}
-            </div>
-          {/each}
-        {:else if toolLogs.length === 0}
-          <div class="log-line">Tool output from minimap2 and samtools appears here during alignment.</div>
-        {:else}
-          {#each toolLogs as entry}
-            <div class="log-line" class:log-error={entry.level === "error"} class:log-warn={entry.level === "warn"}>
-              {entry.message}
-            </div>
-          {/each}
-        {/if}
-      </div>
-    </section>
+      </section>
     </div>
   </main>
+
+  <LogsPanel
+    {logs}
+    {toolLogs}
+    open={logsOpen}
+    onClose={() => (logsOpen = false)}
+    onClearActivity={clearActivityLogs}
+    onClearTools={clearToolLogs}
+  />
+  <ManualPanel />
 </div>
 
 <style>
@@ -409,7 +550,7 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    padding: 12px 20px 14px;
+    padding: 6px 10px 8px;
     background:
       radial-gradient(circle at top left, var(--bg-glow-1), transparent 28%),
       radial-gradient(circle at 85% 10%, var(--bg-glow-2), transparent 24%),
@@ -431,19 +572,15 @@
   }
 
   .files-panel {
-    width: var(--files-width, 58%);
-    min-width: 300px;
-    max-width: 78%;
+    width: var(--files-width, 28%);
+    min-width: 140px;
+    max-width: 85%;
     display: flex;
     flex-direction: column;
     min-height: 0;
     flex-shrink: 0;
     overflow: hidden;
-    padding-bottom: 12px;
-  }
-
-  .files-panel .panel-head {
-    flex-shrink: 0;
+    padding: 8px 8px 8px !important;
   }
 
   .files-panel.dragging {
@@ -452,22 +589,49 @@
     background: var(--drag-bg);
   }
 
-  .panel-hint {
-    color: var(--text-muted);
-    font-size: 0.78rem;
-    white-space: nowrap;
-  }
-
   .files-panel :global(.explorer) {
     flex: 1 1 auto;
     min-height: 0;
   }
 
+  .files-stash {
+    flex: 0 0 28px;
+    width: 28px;
+    margin-right: 4px;
+    border-radius: 10px;
+    border: 1px solid var(--panel-border);
+    background: var(--panel-bg);
+    color: var(--text-menu);
+    cursor: pointer;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    writing-mode: vertical-rl;
+    text-orientation: mixed;
+    font: inherit;
+    font-size: 0.72rem;
+    font-weight: 650;
+    letter-spacing: 0.06em;
+    box-shadow: var(--panel-shadow);
+  }
+
+  .files-stash:hover {
+    color: var(--menu-active-text);
+    background: var(--menu-hover-bg);
+    border-color: var(--chip-active-border);
+  }
+
+  .stash-label {
+    transform: rotate(180deg);
+    padding: 8px 0;
+  }
+
   .resize-handle {
-    flex: 0 0 10px;
-    width: 10px;
-    min-width: 10px;
-    margin: 0 6px;
+    flex: 0 0 6px;
+    width: 6px;
+    min-width: 6px;
+    margin: 0 4px;
     border-radius: 999px;
     cursor: col-resize;
     background: var(--resize-bg);
@@ -484,19 +648,23 @@
 
   .right-column {
     flex: 1;
-    min-width: 280px;
+    min-width: 240px;
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 0;
     min-height: 0;
     overflow: hidden;
+  }
+
+  .right-column > .settings-panel {
+    flex: 1 1 auto;
   }
 
   .panel {
     background: var(--panel-bg);
     border: 1px solid var(--panel-border);
-    border-radius: 20px;
-    padding: 18px;
+    border-radius: 12px;
+    padding: 10px 12px;
     backdrop-filter: blur(10px);
     box-shadow: var(--panel-shadow);
     min-height: 0;
@@ -505,8 +673,65 @@
   .settings-panel {
     flex: 1 1 auto;
     display: flex;
+    flex-direction: row;
+    align-items: stretch;
+    overflow: hidden;
+    min-height: 0;
+    padding: 0;
+  }
+
+  .mode-rail {
+    flex: 0 0 84px;
+    width: 84px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 8px 6px;
+    border-right: 1px solid var(--panel-border);
+    background: color-mix(in srgb, var(--tree-bg) 80%, transparent);
+  }
+
+  .mode-tab {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0;
+    width: 100%;
+    text-align: left;
+    cursor: pointer;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--text-menu);
+    padding: 7px 8px;
+    border-radius: 8px;
+    font: inherit;
+  }
+
+  .mode-tab:hover {
+    background: var(--menu-hover-bg);
+    color: var(--menu-active-text);
+  }
+
+  .mode-tab.active {
+    color: var(--chip-active-text);
+    border-color: var(--chip-active-border);
+    background: var(--chip-active-bg);
+    box-shadow: inset 3px 0 0 var(--accent-highlight);
+  }
+
+  .mode-tab-title {
+    font-size: 0.78rem;
+    font-weight: 650;
+    line-height: 1.15;
+  }
+
+  .settings-body {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
     flex-direction: column;
     overflow: hidden;
+    padding: 8px 10px 10px;
   }
 
   .settings-scroll {
@@ -517,51 +742,16 @@
     padding-right: 2px;
   }
 
-  .log-panel {
-    flex: 0 1 34%;
-    min-height: 140px;
+  .settings-scroll.view-scroll {
     display: flex;
     flex-direction: column;
     overflow: hidden;
   }
 
-  .panel-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    gap: 12px;
-    margin-bottom: 14px;
-    flex-shrink: 0;
-  }
-
   h2 {
     margin: 0;
-    font-size: 1rem;
+    font-size: 0.95rem;
     letter-spacing: 0.02em;
-  }
-
-  .mode-tabs {
-    display: flex;
-    gap: 6px;
-    flex-wrap: wrap;
-    justify-content: flex-end;
-  }
-
-  .mode-tab {
-    cursor: pointer;
-    border: 1px solid var(--chip-border);
-    background: var(--chip-bg);
-    color: var(--text-menu);
-    padding: 6px 12px;
-    border-radius: 999px;
-    font-size: 0.82rem;
-    font-weight: 600;
-  }
-
-  .mode-tab.active {
-    color: var(--chip-active-text);
-    border-color: var(--chip-active-border);
-    background: var(--chip-active-bg);
   }
 
   .field {
@@ -594,7 +784,20 @@
 
   .row {
     display: flex;
+    align-items: stretch;
     gap: 8px;
+    min-width: 0;
+  }
+
+  .row > .ghost {
+    flex: 0 0 auto;
+    align-self: stretch;
+  }
+
+  .row > input:not([type="checkbox"]) {
+    flex: 1 1 auto;
+    min-width: 0;
+    width: auto;
   }
 
   input:not([type="checkbox"]) {
@@ -604,6 +807,16 @@
     border: 1px solid var(--input-border);
     background: var(--input-bg);
     color: var(--text-primary);
+    box-sizing: border-box;
+  }
+
+  input:not([type="checkbox"]):focus,
+  input:not([type="checkbox"]):focus-visible {
+    outline: none;
+    border-color: var(--accent-highlight);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-highlight) 55%, transparent);
+    position: relative;
+    z-index: 1;
   }
 
   .format-groups {
@@ -684,28 +897,6 @@
     flex-wrap: wrap;
   }
 
-  .log-tabs {
-    display: flex;
-    gap: 6px;
-  }
-
-  .log-tab {
-    cursor: pointer;
-    border: 1px solid var(--chip-border);
-    background: var(--chip-bg);
-    color: var(--text-menu);
-    padding: 4px 10px;
-    border-radius: 999px;
-    font-size: 0.78rem;
-    font-weight: 600;
-  }
-
-  .log-tab.active {
-    color: var(--chip-active-text);
-    border-color: var(--chip-active-border);
-    background: var(--chip-active-bg);
-  }
-
   .progress-wrap {
     margin-top: 14px;
     height: 8px;
@@ -733,34 +924,6 @@
     border-radius: 14px;
     background: var(--success-bg);
     border: 1px solid var(--success-border);
-  }
-
-  .log {
-    margin: 0;
-    flex: 1 1 auto;
-    min-height: 0;
-    overflow: auto;
-    padding: 14px;
-    border-radius: 14px;
-    background: var(--log-surface-bg);
-    border: 1px solid var(--log-surface-border);
-    color: var(--log-text);
-    font-family: "JetBrains Mono", monospace;
-    font-size: 0.78rem;
-    line-height: 1.5;
-  }
-
-  .log-line {
-    white-space: pre-wrap;
-    margin-bottom: 2px;
-  }
-
-  .log-line.log-error {
-    color: var(--error);
-  }
-
-  .log-line.log-warn {
-    color: var(--warn);
   }
 
   @media (max-width: 980px) {

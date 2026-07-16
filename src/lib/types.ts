@@ -80,13 +80,149 @@ export interface AlignSummary {
   aligner: string;
 }
 
-export type ToolMode = "convert" | "merge" | "align";
+export type ToolMode = "convert" | "merge" | "align" | "view" | "analyze";
+
+/** Contig/chromosome in a sequence document (View mode). */
+export interface ContigInfo {
+  name: string;
+  length: number;
+}
+
+/** Opened sequence file metadata for View mode. */
+export interface SequenceDocument {
+  path: string;
+  format: string;
+  gzipped: boolean;
+  contigs: ContigInfo[];
+  totalBases: number;
+  /** When true, sequences are held in memory for smooth panning. */
+  fullyCached?: boolean;
+}
+
+/**
+ * Sequence slice for a genomic window.
+ * Coordinates are 0-based half-open [start, end).
+ */
+export interface SequenceSlice {
+  contig: string;
+  start: number;
+  end: number;
+  sequence: string;
+  contigLength: number;
+  reverseComplemented: boolean;
+}
+
+export interface AnnotationContigSpan {
+  name: string;
+  length: number;
+}
+
+export interface AnnotationDocument {
+  path: string;
+  format: string;
+  gzipped: boolean;
+  featureCount: number;
+  contigs: string[];
+  contigSpans: AnnotationContigSpan[];
+}
+
+/** Feature interval; coordinates 0-based half-open [start, end). */
+export interface AnnotationFeature {
+  id: number;
+  contig: string;
+  start: number;
+  end: number;
+  name: string;
+  featureType: string;
+  strand: string;
+  source: string;
+  score?: number | null;
+}
+
+export interface FeatureWindow {
+  contig: string;
+  start: number;
+  end: number;
+  features: AnnotationFeature[];
+  truncated: boolean;
+  totalInRange: number;
+}
+
+export interface AlignmentContig {
+  name: string;
+  length: number;
+}
+
+export interface AlignmentDocument {
+  path: string;
+  format: string;
+  indexed: boolean;
+  contigs: AlignmentContig[];
+  requiresReference: boolean;
+}
+
+export interface CoverageBin {
+  start: number;
+  end: number;
+  depth: number;
+}
+
+export interface CoverageWindow {
+  contig: string;
+  start: number;
+  end: number;
+  bins: CoverageBin[];
+  maxDepth: number;
+}
+
+export interface CigarOp {
+  op: string;
+  length: number;
+}
+
+export interface AlignmentRead {
+  name: string;
+  start: number;
+  end: number;
+  strand: string;
+  mapq: number;
+  cigar: string;
+  cigarOps: CigarOp[];
+  flags: number;
+  sequence: string;
+  qualities: string;
+  isPaired: boolean;
+  isProperPair: boolean;
+  isUnmapped: boolean;
+  isMateUnmapped: boolean;
+  isReverse: boolean;
+  isSecondary: boolean;
+  isSupplementary: boolean;
+  isDuplicate: boolean;
+  isQcFail: boolean;
+  isFirstInPair: boolean;
+  isSecondInPair: boolean;
+  templateLength: number;
+  mateContig: string;
+  mateStart?: number | null;
+}
+
+export interface ReadsWindow {
+  contig: string;
+  start: number;
+  end: number;
+  reads: AlignmentRead[];
+  truncated: boolean;
+  totalInRange: number;
+}
 
 export type LogLevel = "info" | "warn" | "error";
 
 export interface LogEntry {
   level: LogLevel;
   message: string;
+  /** Local wall-clock time when the line was recorded (HH:MM:SS). */
+  time?: string;
 }
 
 export interface ReferenceDownloadProgress {
@@ -141,6 +277,8 @@ export interface UserPreferences {
   browseRoot?: string;
   expandedDirs?: string[];
   filesPaneWidth?: number;
+  /** When true, the input browser is stashed (hidden). */
+  filesPaneCollapsed?: boolean;
   activeMode?: ToolMode;
   convertOutputDir?: string;
   mergeOutputDir?: string;

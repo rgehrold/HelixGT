@@ -3,7 +3,7 @@ import type { JobPreset, ToolMode, UserPreferences } from "$lib/types";
 
 export type { UserPreferences };
 
-const DEFAULT_FILES_PANE_WIDTH = 58;
+const DEFAULT_FILES_PANE_WIDTH = 28;
 
 let cache: UserPreferences = {};
 let loadPromise: Promise<UserPreferences> | null = null;

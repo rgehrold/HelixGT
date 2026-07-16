@@ -158,7 +158,10 @@ fn align_with_minimap2(
         .to_str()
         .context("reference path is not valid UTF-8")?;
 
-    let view_writes_bam = options.minimap2.sort_output || options.output_format != AlignOutputFormat::Sam;
+    let view_writes_bam = options.minimap2.sort_output
+        || options.output_format != AlignOutputFormat::Sam
+        || options.minimap2.filter_unmapped
+        || options.minimap2.mark_duplicates;
     let view_output = if view_writes_bam {
         temp_dir.join("aligned.unsorted.bam")
     } else {
@@ -197,19 +200,76 @@ fn align_with_minimap2(
 
     check_cancel(options.cancel.as_ref())?;
 
-    let mut final_output = match options.output_format {
+    // Optional post-processing on intermediates (not the final SAM/CRAM path).
+    let mut post_input = working_output;
+    // After sort, SAM format yields a .sam intermediate; otherwise intermediate is BAM
+    // when view wrote BAM (BAM/CRAM out, filter, markdup, or sort of BAM).
+    let mut post_is_bam = if options.minimap2.sort_output {
+        options.output_format != AlignOutputFormat::Sam
+    } else {
+        view_writes_bam
+    };
+
+    if options.minimap2.filter_unmapped {
+        let filtered = temp_dir.join("aligned.filtered.bam");
+        filter_unmapped_reads(
+            samtools,
+            reference_str,
+            &post_input,
+            &filtered,
+            AlignOutputFormat::Bam,
+            options.tool_log.clone(),
+        )?;
+        post_input = filtered;
+        post_is_bam = true;
+    }
+
+    if options.minimap2.mark_duplicates
+        && matches!(
+            options.output_format,
+            AlignOutputFormat::Bam | AlignOutputFormat::Cram
+        )
+    {
+        // markdup expects BAM in/out; argument order is input then output.
+        let marked = temp_dir.join("aligned.markdup.bam");
+        mark_duplicates(samtools, &post_input, &marked, options.tool_log.clone())?;
+        post_input = marked;
+        post_is_bam = true;
+    }
+
+    let post_input_is_bam = post_is_bam;
+
+    let final_output = match options.output_format {
         AlignOutputFormat::Sam => {
-            if options.compress {
-                gzip_file(&working_output, output_path)?;
+            let sam_source = if post_input_is_bam {
+                // Intermediate is BAM (sort/filter path) — convert back to SAM text.
+                let sam_temp = temp_dir.join("aligned.final.sam");
+                let mut view_cmd = new_command(samtools);
+                view_cmd.args([
+                    "view",
+                    "-h",
+                    "-T",
+                    reference_str,
+                    "-o",
+                    sam_temp.to_str().context("invalid temp path")?,
+                    post_input.to_str().context("invalid temp path")?,
+                ]);
+                run_logged(view_cmd, "samtools view", options.tool_log.clone())?;
+                sam_temp
             } else {
-                std::fs::copy(&working_output, output_path).with_context(|| {
+                post_input.clone()
+            };
+            if options.compress {
+                gzip_file(&sam_source, output_path)?;
+            } else {
+                std::fs::copy(&sam_source, output_path).with_context(|| {
                     format!("failed to copy SAM to '{}'", output_path.display())
                 })?;
             }
             output_path.to_path_buf()
         }
         AlignOutputFormat::Bam => {
-            std::fs::copy(&working_output, output_path).with_context(|| {
+            std::fs::copy(&post_input, output_path).with_context(|| {
                 format!("failed to copy BAM to '{}'", output_path.display())
             })?;
             output_path.to_path_buf()
@@ -223,54 +283,12 @@ fn align_with_minimap2(
                 reference_str,
                 "-o",
                 output_path.to_str().context("invalid output path")?,
-                working_output.to_str().context("invalid temp path")?,
+                post_input.to_str().context("invalid temp path")?,
             ]);
             run_logged(cram_cmd, "samtools view", options.tool_log.clone())?;
             output_path.to_path_buf()
         }
     };
-
-    if options.minimap2.filter_unmapped {
-        let filtered = temp_dir.join("aligned.filtered.bam");
-        filter_unmapped_reads(
-            samtools,
-            reference_str,
-            &final_output,
-            &filtered,
-            options.output_format,
-            options.tool_log.clone(),
-        )?;
-        if options.output_format == AlignOutputFormat::Sam {
-            if options.compress {
-                gzip_file(&filtered, output_path)?;
-            } else {
-                std::fs::copy(&filtered, output_path)?;
-            }
-            final_output = output_path.to_path_buf();
-        } else if options.output_format == AlignOutputFormat::Cram {
-            let mut cram_cmd = new_command(samtools);
-            cram_cmd.args([
-                "view",
-                "-C",
-                "-T",
-                reference_str,
-                "-o",
-                output_path.to_str().context("invalid output path")?,
-                filtered.to_str().context("invalid temp path")?,
-            ]);
-            run_logged(cram_cmd, "samtools view", options.tool_log.clone())?;
-            final_output = output_path.to_path_buf();
-        } else {
-            std::fs::copy(&filtered, output_path)?;
-            final_output = output_path.to_path_buf();
-        }
-    }
-
-    if options.minimap2.mark_duplicates && matches!(options.output_format, AlignOutputFormat::Bam | AlignOutputFormat::Cram) {
-        let marked = temp_dir.join("aligned.markdup.bam");
-        mark_duplicates(samtools, &final_output, &marked, options.tool_log.clone())?;
-        std::fs::copy(&marked, &final_output)?;
-    }
 
     let index_path = if options.minimap2.index_output
         && matches!(
@@ -501,7 +519,14 @@ fn mark_duplicates(
     let input = input_path.to_str().context("invalid markdup input path")?;
     let output = output_path.to_str().context("invalid markdup output path")?;
     let mut command = new_command(samtools_exe);
-    command.args(["markdup", "-@", &default_thread_count().to_string(), output, input]);
+    // samtools markdup [options] in.bam out.bam
+    command.args([
+        "markdup",
+        "-@",
+        &default_thread_count().to_string(),
+        input,
+        output,
+    ]);
     run_logged(command, "samtools markdup", log)
 }
 

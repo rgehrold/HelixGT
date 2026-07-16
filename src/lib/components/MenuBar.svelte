@@ -1,5 +1,6 @@
 <script lang="ts">
   import { getCurrentWindow } from "@tauri-apps/api/window";
+  import { openManual } from "$lib/manual/store.svelte";
   import {
     applyTheme,
     setMode,
@@ -13,9 +14,20 @@
   interface Props {
     onPrint?: () => void;
     onRestoreView?: () => void;
+    onToggleLogs?: () => void;
+    onToggleFilesBrowser?: () => void;
+    filesBrowserCollapsed?: boolean;
+    logsOpen?: boolean;
   }
 
-  let { onPrint, onRestoreView }: Props = $props();
+  let {
+    onPrint,
+    onRestoreView,
+    onToggleLogs,
+    onToggleFilesBrowser,
+    filesBrowserCollapsed = false,
+    logsOpen = false,
+  }: Props = $props();
 
   type MenuId = "file" | "view" | "about" | "help" | null;
 
@@ -34,11 +46,9 @@
     await getCurrentWindow().close();
   }
 
-  function showAbout() {
+  function openHelp(pageId: string) {
     closeMenus();
-    alert(
-      "HelixGT — Genomics Toolkit\n\nConvert, merge, and align genomics files on Windows.\n\nSupported formats: FASTA, FASTQ, GenBank, GFF, BED, SAM, BAM, CRAM, and VCF.",
-    );
+    openManual(pageId);
   }
 
   function printPage() {
@@ -108,6 +118,16 @@
       </button>
       {#if openMenu === "view"}
         <div class="dropdown">
+          <button
+            class="dropdown-item"
+            onclick={() => {
+              onToggleFilesBrowser?.();
+              closeMenus();
+            }}
+          >
+            {filesBrowserCollapsed ? "Show input browser" : "Hide input browser"}
+          </button>
+          <div class="dropdown-sep" role="separator"></div>
           <button class="dropdown-item" class:selected={theme.mode === "dark"} onclick={() => chooseMode("dark")}>
             <span class="check">{theme.mode === "dark" ? "✓" : ""}</span>
             Dark mode
@@ -125,22 +145,8 @@
             <span class="check">{theme.palette === "orange" ? "✓" : ""}</span>
             Orange theme
           </button>
-          <button class="dropdown-item" onclick={() => { toggleMode(); closeMenus(); }}>
-            Toggle dark / light
-          </button>
           <div class="dropdown-sep" role="separator"></div>
           <button class="dropdown-item" onclick={restoreView}>Restore standard view</button>
-        </div>
-      {/if}
-    </div>
-
-    <div class="menu-group">
-      <button class="menu-trigger" class:active={openMenu === "about"} onclick={() => toggleMenu("about")}>
-        About
-      </button>
-      {#if openMenu === "about"}
-        <div class="dropdown">
-          <button class="dropdown-item" onclick={showAbout}>About HelixGT</button>
         </div>
       {/if}
     </div>
@@ -151,10 +157,47 @@
       </button>
       {#if openMenu === "help"}
         <div class="dropdown">
-          <button class="dropdown-item" disabled>Documentation (coming soon)</button>
+          <button class="dropdown-item" onclick={() => openHelp("welcome")}>User manual</button>
+          <button class="dropdown-item" onclick={() => openHelp("quick-start")}>Quick start</button>
+          <button class="dropdown-item" onclick={() => openHelp("shortcuts")}>Keyboard & mouse</button>
+          <button class="dropdown-item" onclick={() => openHelp("troubleshooting")}>Troubleshooting</button>
+          <div class="dropdown-sep" role="separator"></div>
+          <button class="dropdown-item" onclick={() => openHelp("formats")}>File formats</button>
+          <button class="dropdown-item" onclick={() => openHelp("about")}>About HelixGT</button>
         </div>
       {/if}
     </div>
+  </div>
+
+  <div class="menubar-end">
+    <button
+      type="button"
+      class="logs-btn"
+      class:active={!filesBrowserCollapsed}
+      title={filesBrowserCollapsed ? "Show input browser" : "Hide input browser"}
+      aria-pressed={!filesBrowserCollapsed}
+      onclick={(event) => {
+        event.stopPropagation();
+        closeMenus();
+        onToggleFilesBrowser?.();
+      }}
+    >
+      Files
+    </button>
+    <button
+      type="button"
+      class="logs-btn"
+      class:active={logsOpen}
+      title="Activity and tool logs"
+      aria-pressed={logsOpen}
+      onclick={(event) => {
+        event.stopPropagation();
+        closeMenus();
+        onToggleLogs?.();
+      }}
+    >
+      Logs
+    </button>
   </div>
 </header>
 
@@ -162,9 +205,39 @@
   .menubar {
     display: flex;
     align-items: center;
-    gap: 18px;
-    padding: 0 4px 10px;
+    gap: 10px;
+    padding: 0 2px 6px;
     flex-shrink: 0;
+  }
+
+  .menubar-end {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .logs-btn {
+    cursor: pointer;
+    border: 1px solid var(--chip-border);
+    background: var(--chip-bg);
+    color: var(--text-menu);
+    padding: 3px 10px;
+    border-radius: 999px;
+    font: inherit;
+    font-size: 0.78rem;
+    font-weight: 600;
+  }
+
+  .logs-btn:hover {
+    background: var(--menu-hover-bg);
+    color: var(--menu-active-text);
+  }
+
+  .logs-btn.active {
+    color: var(--chip-active-text);
+    border-color: var(--chip-active-border);
+    background: var(--chip-active-bg);
   }
 
   .logo-btn {
@@ -181,7 +254,7 @@
   }
 
   .app-logo {
-    height: 30px;
+    height: 24px;
     width: auto;
     display: block;
   }
@@ -206,9 +279,9 @@
   }
 
   .menu-trigger {
-    padding: 6px 12px;
-    border-radius: 8px;
-    font-size: 0.88rem;
+    padding: 4px 8px;
+    border-radius: 6px;
+    font-size: 0.82rem;
   }
 
   .menu-trigger:hover,

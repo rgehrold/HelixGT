@@ -2,6 +2,7 @@
   import { open } from "@tauri-apps/plugin-dialog";
   import { openPath } from "@tauri-apps/plugin-opener";
   import { onMount } from "svelte";
+  import InfoLink from "$lib/components/InfoLink.svelte";
   import {
     cancelJob,
     onMergeProgress,
@@ -40,7 +41,6 @@
   let lastSummary = $state<MergeSummary | null>(null);
   let mergeProgress = $state<MergeProgress | null>(null);
   let currentJobId = $state<string | null>(null);
-  let referencePath = $state("");
 
   onMount(() => {
     let unlisten: (() => void) | undefined;
@@ -104,7 +104,6 @@
       mode: "merge",
       inputPaths: selectedPaths,
       outputDir: outputDir.trim(),
-      referencePath: validation?.format === "cram" ? referencePath.trim() || null : null,
     });
     if (!preflight.ok) {
       onLog(preflight.issues.map((issue) => issue.message).join("\n"), "error");
@@ -123,8 +122,6 @@
         outputDir: outputDir.trim(),
         outputName: outputName.trim(),
         compress,
-        referencePath:
-          validation?.format === "cram" ? referencePath.trim() || null : null,
         jobId: currentJobId,
       });
       lastSummary = summary;
@@ -159,62 +156,51 @@
 </script>
 
 <div class="pane-body">
-  <p class="intro">
-    Combine multiple files with the <strong>same extension</strong>. Similar filenames are detected
-    automatically and a merged name is suggested.
-  </p>
-
   {#if validation}
-    <div class="status" class:ok={validation.isValid} class:bad={!validation.isValid}>
+    <div class="status compact" class:ok={validation.isValid} class:bad={!validation.isValid}>
       {validation.message}
     </div>
   {/if}
 
   {#if suggestion?.similar}
-    <div class="hint-box">
-      <span>Similar names detected</span>
-      {#if suggestion.commonPrefix}
-        <p>Common prefix: <code>{suggestion.commonPrefix}</code></p>
-      {/if}
-      {#if suggestion.commonSuffix}
-        <p>Common suffix: <code>{suggestion.commonSuffix}</code></p>
-      {/if}
-    </div>
+    <p class="subtle hint-line">
+      Similar names
+      {#if suggestion.commonPrefix} · prefix <code>{suggestion.commonPrefix}</code>{/if}
+      {#if suggestion.commonSuffix} · suffix <code>{suggestion.commonSuffix}</code>{/if}
+    </p>
   {/if}
 
-  <label class="field">
-    <span>Output folder</span>
+  <div class="field">
+    <span class="field-label">Output folder <InfoLink section="merge-output-folder" label="Output folder — manual" /></span>
     <div class="row">
+      <button class="ghost compact" onclick={browseOutputDir} disabled={disabled || isMerging}>Choose</button>
       <input
         value={outputDir}
         oninput={(event) => onOutputDirChange((event.currentTarget as HTMLInputElement).value)}
-        placeholder="C:\path\to\output"
+        placeholder="Output folder"
         disabled={disabled || isMerging}
       />
-      <button class="ghost" onclick={browseOutputDir} disabled={disabled || isMerging}>Choose</button>
     </div>
-  </label>
+  </div>
 
-  <label class="field">
-    <span>Merged filename</span>
+  <div class="field">
+    <span class="field-label">Merged filename <InfoLink section="merge-filename" label="Merged filename — manual" /></span>
     <input bind:value={outputName} placeholder="sample_merged.fasta.gz" disabled={disabled || isMerging} />
-  </label>
+  </div>
 
-  <label class="toggle">
+  <label class="toggle inline">
     <input
       type="checkbox"
       checked={compress ?? false}
       onchange={(event) => (compress = (event.currentTarget as HTMLInputElement).checked)}
       disabled={disabled || isMerging}
     />
-    <span>Gzip compress output (.gz)</span>
+    <span>Gzip output</span>
+    <InfoLink section="merge-gzip" label="Gzip compress — manual" />
   </label>
 
   {#if validation?.format === "cram"}
-    <label class="field">
-      <span>Reference FASTA (required for CRAM merge)</span>
-      <input bind:value={referencePath} placeholder="C:\path\to\reference.fasta" disabled={disabled || isMerging} />
-    </label>
+    <p class="subtle">CRAM concat uses first header — convert to BAM for re-encode.</p>
   {/if}
 
   <div class="row actions">
@@ -222,7 +208,7 @@
       {isMerging ? "Merging…" : "Run merge"}
     </button>
     {#if isMerging}
-      <button class="ghost" onclick={cancelMerge}>Cancel</button>
+      <button class="ghost compact" onclick={cancelMerge}>Cancel</button>
     {/if}
   </div>
 
@@ -274,66 +260,81 @@
     color: var(--status-error-text);
   }
 
-  .hint-box {
-    margin-bottom: 14px;
-    padding: 10px 12px;
-    border-radius: 12px;
-    border: 1px solid var(--chip-active-border);
-    background: var(--tree-focus);
-    color: var(--code-color);
-    font-size: 0.84rem;
-  }
-
-  .hint-box span {
-    display: block;
-    font-weight: 600;
-    margin-bottom: 6px;
-  }
-
-  .hint-box p {
-    margin: 4px 0 0;
+  .hint-line {
+    margin: 0 0 8px;
   }
 
   code {
     font-family: "JetBrains Mono", monospace;
-    font-size: 0.8rem;
+    font-size: 0.76rem;
   }
 
   .field {
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    margin-bottom: 16px;
+    gap: 4px;
+    margin-bottom: 10px;
   }
 
-  .field > span,
-  .toggle span {
+  .field-label {
+    display: flex;
+    align-items: center;
+    gap: 4px;
     color: var(--text-menu);
-    font-size: 0.92rem;
-    font-weight: 500;
+    font-size: 0.78rem;
+    font-weight: 600;
   }
 
   .row {
     display: flex;
-    gap: 8px;
+    align-items: stretch;
+    gap: 6px;
+    min-width: 0;
+  }
+
+  .row > .ghost {
+    flex: 0 0 auto;
+  }
+
+  .row > input:not([type="checkbox"]) {
+    flex: 1 1 auto;
+    min-width: 0;
+    width: auto;
   }
 
   input:not([type="checkbox"]) {
     width: 100%;
-    padding: 11px 12px;
-    border-radius: 12px;
+    padding: 7px 10px;
+    border-radius: 8px;
     border: 1px solid var(--input-border);
     background: var(--input-bg);
     color: var(--text-primary);
+    box-sizing: border-box;
+    font-size: 0.84rem;
+  }
+
+  input:not([type="checkbox"]):focus,
+  input:not([type="checkbox"]):focus-visible {
+    outline: none;
+    border-color: var(--accent-highlight);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-highlight) 55%, transparent);
+    position: relative;
+    z-index: 1;
   }
 
   .ghost,
   .primary {
     cursor: pointer;
     border: none;
-    padding: 10px 14px;
-    border-radius: 12px;
+    padding: 7px 12px;
+    border-radius: 8px;
     font-weight: 600;
+    font-size: 0.82rem;
+  }
+
+  .ghost.compact {
+    padding: 5px 10px;
+    font-size: 0.78rem;
   }
 
   .ghost {
@@ -343,11 +344,38 @@
   }
 
   .primary {
-    width: 100%;
-    margin-top: 8px;
+    flex: 1 1 auto;
+    margin-top: 0;
     background: var(--primary-bg);
     color: var(--primary-text);
     box-shadow: var(--primary-shadow);
+  }
+
+  .toggle.inline {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 10px;
+    font-size: 0.8rem;
+    color: var(--text-menu);
+    cursor: pointer;
+  }
+
+  .status.compact {
+    margin-bottom: 8px;
+    padding: 6px 10px;
+    border-radius: 8px;
+    font-size: 0.8rem;
+  }
+
+  .subtle {
+    margin: 0 0 8px;
+    color: var(--text-muted);
+    font-size: 0.74rem;
+  }
+
+  .actions {
+    gap: 6px;
   }
 
   .primary:disabled,
@@ -359,8 +387,22 @@
   .toggle {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 6px;
     margin-bottom: 8px;
+  }
+
+  .toggle-control {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    cursor: pointer;
+  }
+
+  .subtle {
+    margin: 0 0 12px;
+    color: var(--text-muted);
+    font-size: 0.82rem;
+    line-height: 1.45;
   }
 
   .success {

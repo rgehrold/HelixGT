@@ -3,7 +3,7 @@
   import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
   import { onMount } from "svelte";
   import type { UnlistenFn } from "@tauri-apps/api/event";
-  import HelpTip from "$lib/components/HelpTip.svelte";
+  import InfoLink from "$lib/components/InfoLink.svelte";
   import {
     cancelJob,
     onConvertProgress,
@@ -70,6 +70,9 @@
   let lastSummary = $state<ConvertSummary | null>(null);
   let preflight = $state<PreflightResponse | null>(null);
   let currentJobId = $state<string | null>(null);
+  /** Once the user picks a format pill, stop overwriting it with auto-suggestions. */
+  let userChoseFormat = $state(false);
+  let previousSelectionLen = $state(0);
 
   const selectedHasCram = $derived(selectedPaths.some((path) => /\.cram$/i.test(path)));
 
@@ -90,7 +93,20 @@
   });
 
   $effect(() => {
-    void refreshSuggestedFormat(selectedPaths);
+    const len = selectedPaths.length;
+    // Suggest only when selection first becomes non-empty (or after clear), and only if
+    // the user has not manually chosen a format. Avoids stomping their choice every click.
+    if (len === 0) {
+      previousSelectionLen = 0;
+      preflight = null;
+      return;
+    }
+    if (previousSelectionLen === 0 && !userChoseFormat) {
+      void refreshSuggestedFormat(selectedPaths);
+    } else {
+      preflight = null;
+    }
+    previousSelectionLen = len;
   });
 
   onMount(() => {
@@ -110,7 +126,7 @@
 
   async function refreshSuggestedFormat(paths: string[]) {
     preflight = null;
-    if (paths.length === 0) return;
+    if (paths.length === 0 || userChoseFormat) return;
 
     try {
       const suggested = await suggestOutputFormat(paths);
@@ -345,13 +361,8 @@
 </script>
 
 <div class="pane-body">
-  <p class="intro">
-    Convert selected files to another genomics format. Output format is suggested automatically from
-    your selection.
-  </p>
-
-  <label class="field">
-    <span>Output format</span>
+  <div class="field">
+    <span class="field-label">Output format <InfoLink section="convert" label="Convert — manual" /></span>
     <div class="format-groups">
       {#each categoryOrder as category}
         {@const categoryFormats = formats.filter((format) => format.category === category)}
@@ -363,7 +374,10 @@
                 <button
                   class="pill"
                   class:active={outputFormat === format.id}
-                  onclick={() => onOutputFormatChange(format.id)}
+                  onclick={() => {
+                    userChoseFormat = true;
+                    onOutputFormatChange(format.id);
+                  }}
                   disabled={disabled || isBusy}
                 >
                   {format.label}
@@ -374,96 +388,80 @@
         {/if}
       {/each}
     </div>
-  </label>
+  </div>
 
-  <label class="field">
-    <span>Output folder</span>
+  <div class="field">
+    <span class="field-label">Output folder <InfoLink section="convert-output-folder" label="Output folder — manual" /></span>
     <div class="row">
+      <button class="ghost compact" onclick={browseOutputDir} disabled={disabled || isBusy}>Choose</button>
       <input
         value={outputDir}
         oninput={(event) => onOutputDirChange((event.currentTarget as HTMLInputElement).value)}
-        placeholder="C:\path\to\output"
+        placeholder="Output folder"
         disabled={disabled || isBusy}
       />
-      <button class="ghost" onclick={browseOutputDir} disabled={disabled || isBusy}>Choose</button>
     </div>
-  </label>
+  </div>
 
-  <label class="field">
-    <span>Filename prefix (optional)</span>
-    <input bind:value={prefix} placeholder="run42_" disabled={disabled || isBusy} />
-  </label>
-
-  <label class="toggle">
-    <input
-      type="checkbox"
-      checked={compress}
-      onchange={(event) => (compress = (event.currentTarget as HTMLInputElement).checked)}
-      disabled={disabled || isBusy || outputFormat === "cram"}
-    />
-    <span>Gzip compress text outputs (.gz)</span>
-    <HelpTip text="Applies to text formats such as FASTA, FASTQ, SAM, GFF, and VCF. Binary BAM/CRAM are always compressed internally." />
-  </label>
+  <div class="field-row">
+    <div class="field grow">
+      <span class="field-label">Prefix <InfoLink section="convert-prefix" label="Filename prefix — manual" /></span>
+      <input bind:value={prefix} placeholder="optional" disabled={disabled || isBusy} />
+    </div>
+    <label class="toggle inline">
+      <input
+        type="checkbox"
+        checked={compress}
+        onchange={(event) => (compress = (event.currentTarget as HTMLInputElement).checked)}
+        disabled={disabled || isBusy || outputFormat === "cram"}
+      />
+      <span>Gzip text</span>
+      <InfoLink section="convert-gzip" label="Gzip compress — manual" />
+    </label>
+  </div>
 
   {#if needsReference}
-    <label class="field">
-      <span class="label-with-help">
-        <span>Reference FASTA (required for CRAM)</span>
-        <HelpTip text="CRAM stores differences against a reference FASTA. Required when converting to or from CRAM. The app also looks for a matching FASTA next to each CRAM file. Right-click a FASTA and choose Set as reference." />
-      </span>
+    <div class="field">
+      <span class="field-label">CRAM reference <InfoLink section="convert-cram-reference" label="CRAM reference — manual" /></span>
       <div class="row">
+        <button class="ghost compact" onclick={browseReferenceFasta} disabled={disabled || isBusy}>Choose</button>
         <input
           bind:value={referencePath}
-          placeholder="C:\path\to\reference.fasta"
+          placeholder="Reference FASTA"
           disabled={disabled || isBusy}
         />
-        <button class="ghost" onclick={browseReferenceFasta} disabled={disabled || isBusy}>
-          Choose
-        </button>
       </div>
-      <p class="subtle">
-        {#if outputFormat === "cram"}
-          Applies to all selected SAM/BAM files ({alignmentInputPaths.length} of {selectedPaths.length}
-          selected).
-        {:else if selectedHasCram}
-          Used to decode {selectedPaths.filter((path) => /\.cram$/i.test(path)).length} selected CRAM
-          file(s).
-        {/if}
-      </p>
-    </label>
+    </div>
   {/if}
 
   {#if preflight}
-    <div class="status" class:ok={preflight.ok} class:bad={!preflight.ok}>
+    <div class="status compact" class:ok={preflight.ok} class:bad={!preflight.ok}>
       {#if preflight.ok}
-        Preflight passed — estimated output {formatBytes(preflight.estimatedOutputBytes)}.
+        Preflight OK · ~{formatBytes(preflight.estimatedOutputBytes)}
       {:else}
-        Preflight found {preflight.issues.length} issue(s).
+        Preflight: {preflight.issues.length} issue(s)
       {/if}
     </div>
   {/if}
 
   <div class="actions">
-    <button class="ghost" onclick={runPreflight} disabled={disabled || isBusy}>
-      {isPreflighting ? "Checking…" : "Preflight check"}
+    {#if isConverting}
+      <button class="primary" disabled>Converting…</button>
+      <button class="ghost compact danger" onclick={cancelConversion}>Cancel</button>
+    {:else}
+      <button class="primary" onclick={startConversion} disabled={disabled || isBusy}>
+        Run conversion
+      </button>
+    {/if}
+    <button class="ghost compact" onclick={runPreflight} disabled={disabled || isBusy} title="Preflight check">
+      {isPreflighting ? "…" : "Preflight"}
     </button>
     {#if singleFastqPath}
-      <button class="ghost" onclick={runQc} disabled={disabled || isBusy}>
-        {isRunningQc ? "Running QC…" : "FASTQ QC"}
+      <button class="ghost compact" onclick={runQc} disabled={disabled || isBusy} title="FASTQ QC (or use Analyze)">
+        {isRunningQc ? "…" : "QC"}
       </button>
     {/if}
   </div>
-
-  {#if isConverting}
-    <div class="actions">
-      <button class="primary" disabled>Converting…</button>
-      <button class="ghost danger" onclick={cancelConversion}>Cancel</button>
-    </div>
-  {:else}
-    <button class="primary" onclick={startConversion} disabled={disabled || isBusy}>
-      Run conversion
-    </button>
-  {/if}
 
   {#if progress}
     <div class="progress-wrap">
@@ -502,73 +500,97 @@
     gap: 0;
   }
 
-  .intro {
-    margin: 0 0 14px;
-    color: var(--text-muted);
-    font-size: 0.88rem;
-    line-height: 1.5;
-  }
-
   .field {
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    margin-bottom: 16px;
+    gap: 4px;
+    margin-bottom: 10px;
   }
 
-  .field > span,
-  .toggle span,
-  .label-with-help {
-    color: var(--text-menu);
-    font-size: 0.92rem;
-    font-weight: 500;
+  .field.grow {
+    flex: 1;
+    margin-bottom: 0;
   }
 
-  .label-with-help {
+  .field-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    align-items: flex-end;
+    margin-bottom: 10px;
+  }
+
+  .field-label {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 4px;
+    color: var(--text-menu);
+    font-size: 0.78rem;
+    font-weight: 600;
   }
 
   .subtle {
     margin: 0;
     color: var(--text-muted);
-    font-size: 0.82rem;
-    line-height: 1.45;
+    font-size: 0.74rem;
+    line-height: 1.35;
   }
 
   .row {
     display: flex;
-    gap: 8px;
+    align-items: stretch;
+    gap: 6px;
+    min-width: 0;
+  }
+
+  .row > .ghost {
+    flex: 0 0 auto;
+  }
+
+  .row > input:not([type="checkbox"]) {
+    flex: 1 1 auto;
+    min-width: 0;
+    width: auto;
   }
 
   input:not([type="checkbox"]) {
     width: 100%;
-    padding: 11px 12px;
-    border-radius: 12px;
+    padding: 7px 10px;
+    border-radius: 8px;
     border: 1px solid var(--input-border);
     background: var(--input-bg);
     color: var(--text-primary);
+    box-sizing: border-box;
+    font-size: 0.84rem;
+  }
+
+  input:not([type="checkbox"]):focus,
+  input:not([type="checkbox"]):focus-visible {
+    outline: none;
+    border-color: var(--accent-highlight);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-highlight) 55%, transparent);
+    position: relative;
+    z-index: 1;
   }
 
   .format-groups {
     display: flex;
     flex-direction: column;
-    gap: 12px;
+    gap: 8px;
   }
 
   .format-group p {
-    margin: 0 0 6px;
+    margin: 0 0 4px;
     color: var(--text-muted);
-    font-size: 0.78rem;
+    font-size: 0.68rem;
     text-transform: uppercase;
-    letter-spacing: 0.08em;
+    letter-spacing: 0.06em;
   }
 
   .pills {
     display: flex;
     flex-wrap: wrap;
-    gap: 8px;
+    gap: 4px;
   }
 
   .pill,
@@ -579,12 +601,13 @@
   }
 
   .pill {
-    padding: 8px 12px;
+    padding: 4px 10px;
     border-radius: 999px;
     background: var(--chip-bg);
     color: var(--text-menu);
     border: 1px solid var(--chip-border);
     transition: all 0.15s ease;
+    font-size: 0.78rem;
   }
 
   .pill.active {
@@ -595,9 +618,16 @@
 
   .ghost,
   .primary {
-    padding: 10px 14px;
-    border-radius: 12px;
+    padding: 7px 12px;
+    border-radius: 8px;
     font-weight: 600;
+    font-size: 0.82rem;
+    cursor: pointer;
+  }
+
+  .ghost.compact {
+    padding: 5px 10px;
+    font-size: 0.78rem;
   }
 
   .ghost {
@@ -613,8 +643,8 @@
   }
 
   .primary {
-    width: 100%;
-    margin-top: 8px;
+    flex: 1 1 auto;
+    margin-top: 0;
     background: var(--primary-bg);
     color: var(--primary-text);
     box-shadow: var(--primary-shadow);
@@ -630,30 +660,36 @@
   .toggle {
     display: flex;
     align-items: center;
-    gap: 10px;
-    margin-bottom: 8px;
+    gap: 6px;
     flex-wrap: wrap;
+  }
+
+  .toggle.inline {
+    margin-bottom: 0;
+    padding-bottom: 2px;
+    font-size: 0.8rem;
+    color: var(--text-menu);
   }
 
   .actions {
     display: flex;
-    gap: 8px;
+    gap: 6px;
     flex-wrap: wrap;
-    margin-bottom: 8px;
-  }
-
-  .actions .primary {
-    flex: 1 1 auto;
-    margin-top: 0;
+    margin-bottom: 6px;
+    align-items: center;
   }
 
   .status {
-    margin-bottom: 14px;
-    padding: 10px 12px;
-    border-radius: 12px;
-    font-size: 0.88rem;
+    margin-bottom: 8px;
+    padding: 6px 10px;
+    border-radius: 8px;
+    font-size: 0.8rem;
     border: 1px solid var(--chip-border);
     background: var(--chip-bg);
+  }
+
+  .status.compact {
+    margin-bottom: 8px;
   }
 
   .status.ok {

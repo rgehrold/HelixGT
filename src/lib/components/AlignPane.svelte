@@ -4,7 +4,7 @@
   import { listen } from "@tauri-apps/api/event";
   import { open, save } from "@tauri-apps/plugin-dialog";
   import { onMount } from "svelte";
-  import HelpTip from "$lib/components/HelpTip.svelte";
+  import InfoLink from "$lib/components/InfoLink.svelte";
   import type {
     AlignSummary,
     EnsemblReferenceInfo,
@@ -124,8 +124,15 @@
       loadedReference = await invoke<ReferenceFetchResult>("fetch_ensembl_reference", {
         id: selectedReferenceId,
       });
+      const sizeMb = (loadedReference.sequenceBytes / 1_000_000).toFixed(1);
+      if (loadedReference.cached) {
+        onLog(`Reference ready from cache — ${loadedReference.label} (${sizeMb} MB sequence).`);
+      } else {
+        onLog(`Reference downloaded — ${loadedReference.label} (${sizeMb} MB sequence).`);
+      }
     } catch (error) {
       referenceError = String(error);
+      onLog(`Reference download failed: ${String(error)}`, "error");
     } finally {
       isFetching = false;
       downloadProgress = null;
@@ -251,30 +258,24 @@
 
 <div class="pane-body">
   <div class="field">
-    <div class="field-label">
-      <span>Reference genome</span>
-      <HelpTip
-        label="Reference genome help"
-        text="Download from NCBI RefSeq into a session cache, or pick a local FASTA. Alignment pipes minimap2 through samtools for valid headers, sorting, BAM/CRAM output, and indexing. For large whole-genome runs prefer CRAM."
-      />
-    </div>
+    <span class="field-label">Reference <InfoLink section="align-reference" label="Reference genome — manual" /></span>
     <select bind:value={selectedReferenceId} disabled={disabled || isFetching || isAligning}>
       {#each references as reference}
         <option value={reference.id}>
-          {reference.label} (~{reference.compressedSizeMb} MB compressed)
+          {reference.label} (~{reference.compressedSizeMb} MB)
         </option>
       {/each}
     </select>
     <div class="row">
       <button
-        class="ghost"
+        class="ghost compact"
         onclick={fetchReference}
         disabled={disabled || isFetching || isAligning || selectedReferenceId.startsWith("local:")}
       >
-        {isFetching ? "Downloading…" : "Download from NCBI"}
+        {isFetching ? "Downloading…" : "Download"}
       </button>
-      <button class="ghost" onclick={browseLocalReference} disabled={disabled || isFetching || isAligning}>
-        Local FASTA…
+      <button class="ghost compact" onclick={browseLocalReference} disabled={disabled || isFetching || isAligning}>
+        Local…
       </button>
     </div>
     {#if isFetching}
@@ -325,105 +326,86 @@
     </div>
   {/if}
 
-  <div class="field">
-    <span>Read files ({readPaths.length} selected)</span>
-    <p class="subtle">
-      {#if readPaths.length === 0}
-        No FASTA/FASTQ files selected in the browser.
-      {:else}
-        {readPaths.map((path) => path.split(/[\\/]/).pop()).join(", ")}
-      {/if}
-    </p>
-  </div>
+  <p class="subtle">
+    Reads: {#if readPaths.length === 0}<em>none selected</em>{:else}{readPaths.length} file(s) — {readPaths.map((path) => path.split(/[\\/]/).pop()).join(", ")}{/if}
+  </p>
 
-  <label class="field">
-    <span>Output folder</span>
+  <div class="field">
+    <span class="field-label">Output folder</span>
     <div class="row">
+      <button class="ghost compact" onclick={browseOutputDir} disabled={disabled || isAligning}>Choose</button>
       <input
         value={outputDir}
         oninput={(event) => onOutputDirChange((event.currentTarget as HTMLInputElement).value)}
-        placeholder="C:\path\to\output"
+        placeholder="Output folder"
         disabled={disabled || isAligning}
       />
-      <button class="ghost" onclick={browseOutputDir} disabled={disabled || isAligning}>Choose</button>
-    </div>
-  </label>
-
-  <label class="field">
-    <span>Output basename</span>
-    <input bind:value={outputStem} placeholder="aligned_reads" disabled={disabled || isAligning} />
-  </label>
-
-  <div class="field">
-    <span>Output format</span>
-    <div class="pills">
-      <button class="pill" class:active={outputFormat === "sam"} onclick={() => (outputFormat = "sam")} disabled={disabled || isAligning}>
-        SAM
-      </button>
-      <button class="pill" class:active={outputFormat === "bam"} onclick={() => (outputFormat = "bam")} disabled={disabled || isAligning}>
-        BAM
-      </button>
-      <button class="pill" class:active={outputFormat === "cram"} onclick={() => (outputFormat = "cram")} disabled={disabled || isAligning}>
-        CRAM
-      </button>
     </div>
   </div>
 
-  {#if outputFormat === "sam"}
-    <label class="toggle">
-      <input type="checkbox" bind:checked={compress} disabled={disabled || isAligning} />
-      <span>Gzip compress SAM output (.sam.gz)</span>
-      <HelpTip text="Only applies to SAM output. Writes a .sam.gz file instead of plain text SAM." />
-    </label>
-  {/if}
+  <div class="field-row">
+    <div class="field grow">
+      <span class="field-label">Basename</span>
+      <input bind:value={outputStem} placeholder="aligned_reads" disabled={disabled || isAligning} />
+    </div>
+    <div class="field">
+      <span class="field-label">Format</span>
+      <div class="pills">
+        <button class="pill" class:active={outputFormat === "sam"} onclick={() => (outputFormat = "sam")} disabled={disabled || isAligning}>SAM</button>
+        <button class="pill" class:active={outputFormat === "bam"} onclick={() => (outputFormat = "bam")} disabled={disabled || isAligning}>BAM</button>
+        <button class="pill" class:active={outputFormat === "cram"} onclick={() => (outputFormat = "cram")} disabled={disabled || isAligning}>CRAM</button>
+      </div>
+    </div>
+  </div>
 
-  <div class="field">
-    <span>Minimap2 options</span>
-    <label class="field-inline">
-      <span class="label-with-help">
-        <span>Read preset</span>
-        <HelpTip text="Minimap2 -x preset. Use General for standard Illumina WGS. Short reads (-x sr) is for small genomes or short inserts, not typical 90 GB WGS runs." />
-      </span>
-      <select bind:value={preset} disabled={disabled || isAligning}>
-        <option value="general">General</option>
-        <option value="sr">Short reads (-x sr)</option>
-        <option value="ont">Nanopore (-x map-ont)</option>
-        <option value="hifi">PacBio HiFi (-x map-hifi)</option>
-        <option value="splice">RNA-seq / splice (-x splice)</option>
-        <option value="asm5">Assembly (-x asm5)</option>
-      </select>
-    </label>
-    <label class="toggle">
-      <input type="checkbox" bind:checked={indexReference} disabled={disabled || isAligning} />
-      <span>Build reference index (.mmi) before aligning</span>
-      <HelpTip text="Runs minimap2 -d to build a .mmi index first. Helps repeat alignments to the same reference; optional for one-off runs." />
-    </label>
-    <label class="toggle">
-      <input type="checkbox" bind:checked={sortOutput} disabled={disabled || isAligning} />
-      <span>Sort alignments by coordinate (samtools sort)</span>
-      <HelpTip text="Sorts by chromosome and position. Required for IGV and most downstream tools." />
-    </label>
-    <label class="toggle">
-      <input type="checkbox" bind:checked={secondaryAlignments} disabled={disabled || isAligning} />
-      <span>Report secondary alignments</span>
-      <HelpTip text="When off, minimap2 uses -N 0 and reports only primary alignments per read." />
-    </label>
-    {#if outputFormat !== "sam"}
-      <label class="toggle">
-        <input type="checkbox" bind:checked={indexOutput} disabled={disabled || isAligning} />
-        <span>Create index (.bai / .crai) for IGV</span>
-        <HelpTip text="Runs samtools index after BAM/CRAM output so IGV can load the file without building an index itself." />
+  <details class="options-panel">
+    <summary>Alignment options</summary>
+    <div class="options-body">
+      <label class="field compact">
+        <span class="field-label">Preset <InfoLink section="align-preset" label="Read preset — manual" /></span>
+        <select bind:value={preset} disabled={disabled || isAligning}>
+          <option value="general">General</option>
+          <option value="sr">Short reads (-x sr)</option>
+          <option value="ont">Nanopore (-x map-ont)</option>
+          <option value="hifi">PacBio HiFi (-x map-hifi)</option>
+          <option value="splice">RNA-seq / splice (-x splice)</option>
+          <option value="asm5">Assembly (-x asm5)</option>
+        </select>
       </label>
-    {/if}
-    <label class="toggle">
-      <input type="checkbox" bind:checked={filterUnmapped} disabled={disabled || isAligning} />
-      <span>Remove unmapped reads (samtools view -F 4)</span>
-    </label>
-    <label class="toggle">
-      <input type="checkbox" bind:checked={markDuplicates} disabled={disabled || isAligning || outputFormat === "sam"} />
-      <span>Mark/remove duplicates (samtools markdup)</span>
-    </label>
-  </div>
+      {#if outputFormat === "sam"}
+        <label class="toggle inline">
+          <input type="checkbox" bind:checked={compress} disabled={disabled || isAligning} />
+          <span>Gzip SAM (.sam.gz)</span>
+        </label>
+      {/if}
+      <label class="toggle inline">
+        <input type="checkbox" bind:checked={indexReference} disabled={disabled || isAligning} />
+        <span>Build .mmi index first</span>
+      </label>
+      <label class="toggle inline">
+        <input type="checkbox" bind:checked={sortOutput} disabled={disabled || isAligning} />
+        <span>Sort by coordinate</span>
+      </label>
+      <label class="toggle inline">
+        <input type="checkbox" bind:checked={secondaryAlignments} disabled={disabled || isAligning} />
+        <span>Secondary alignments</span>
+      </label>
+      {#if outputFormat !== "sam"}
+        <label class="toggle inline">
+          <input type="checkbox" bind:checked={indexOutput} disabled={disabled || isAligning} />
+          <span>Create .bai / .crai</span>
+        </label>
+      {/if}
+      <label class="toggle inline">
+        <input type="checkbox" bind:checked={filterUnmapped} disabled={disabled || isAligning} />
+        <span>Drop unmapped</span>
+      </label>
+      <label class="toggle inline">
+        <input type="checkbox" bind:checked={markDuplicates} disabled={disabled || isAligning || outputFormat === "sam"} />
+        <span>Mark duplicates</span>
+      </label>
+    </div>
+  </details>
 
   {#if !minimap2Available || !samtoolsAvailable}
     <p class="note">
@@ -468,8 +450,8 @@
   .field {
     display: flex;
     flex-direction: column;
-    gap: 8px;
-    margin-bottom: 16px;
+    gap: 4px;
+    margin-bottom: 10px;
   }
 
   .field-inline {
@@ -483,51 +465,118 @@
     font-size: 0.82rem;
   }
 
-  .field-label,
   .label-with-help {
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
   }
 
-  .field > span,
-  .field-label > span,
-  .toggle span {
+  .field-label {
+    display: flex;
+    align-items: center;
+    gap: 4px;
     color: var(--text-menu);
-    font-size: 0.92rem;
-    font-weight: 500;
+    font-size: 0.78rem;
+    font-weight: 600;
   }
 
-  .toggle {
+  .field.compact {
+    margin-bottom: 8px;
+  }
+
+  .field-row {
+    display: flex;
     flex-wrap: wrap;
+    gap: 10px;
+    align-items: flex-end;
+    margin-bottom: 10px;
+  }
+
+  .field.grow {
+    flex: 1;
+    min-width: 140px;
+    margin-bottom: 0;
+  }
+
+  .options-panel {
+    margin-bottom: 10px;
+    border: 1px solid var(--chip-border);
+    border-radius: 8px;
+    background: var(--chip-bg);
+    padding: 0 8px;
+  }
+
+  .options-panel summary {
+    cursor: pointer;
+    padding: 7px 4px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--text-menu);
+    list-style: none;
+  }
+
+  .options-panel summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .options-body {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 0 4px 10px;
   }
 
   .subtle {
-    margin: 0;
+    margin: 0 0 8px;
     color: var(--text-muted);
-    font-size: 0.82rem;
-    line-height: 1.45;
+    font-size: 0.74rem;
+    line-height: 1.35;
     word-break: break-word;
   }
 
   select,
   input:not([type="checkbox"]) {
     width: 100%;
-    padding: 11px 12px;
-    border-radius: 12px;
+    padding: 7px 10px;
+    border-radius: 8px;
     border: 1px solid var(--input-border);
     background: var(--input-bg);
     color: var(--text-primary);
+    box-sizing: border-box;
+    font-size: 0.84rem;
+  }
+
+  select:focus,
+  select:focus-visible,
+  input:not([type="checkbox"]):focus,
+  input:not([type="checkbox"]):focus-visible {
+    outline: none;
+    border-color: var(--accent-highlight);
+    box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent-highlight) 55%, transparent);
+    position: relative;
+    z-index: 1;
   }
 
   .row {
     display: flex;
-    gap: 8px;
+    align-items: stretch;
+    gap: 6px;
+    min-width: 0;
+  }
+
+  .row > .ghost {
+    flex: 0 0 auto;
+  }
+
+  .row > input:not([type="checkbox"]) {
+    flex: 1 1 auto;
+    min-width: 0;
+    width: auto;
   }
 
   .pills {
     display: flex;
-    gap: 8px;
+    gap: 4px;
   }
 
   .pill,
@@ -538,11 +587,12 @@
   }
 
   .pill {
-    padding: 8px 12px;
+    padding: 4px 10px;
     border-radius: 999px;
     background: var(--chip-bg);
     color: var(--text-menu);
     border: 1px solid var(--chip-border);
+    font-size: 0.78rem;
   }
 
   .pill.active {
@@ -553,9 +603,15 @@
 
   .ghost,
   .primary {
-    padding: 10px 14px;
-    border-radius: 12px;
+    padding: 7px 12px;
+    border-radius: 8px;
     font-weight: 600;
+    font-size: 0.82rem;
+  }
+
+  .ghost.compact {
+    padding: 5px 10px;
+    font-size: 0.78rem;
   }
 
   .ghost {
@@ -565,8 +621,8 @@
   }
 
   .primary {
-    width: 100%;
-    margin-top: 8px;
+    flex: 1 1 auto;
+    margin-top: 0;
     background: var(--primary-bg);
     color: var(--primary-text);
     box-shadow: var(--primary-shadow);
@@ -579,11 +635,28 @@
     cursor: not-allowed;
   }
 
+  .toggle.inline {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 0;
+    font-size: 0.8rem;
+    color: var(--text-menu);
+    cursor: pointer;
+  }
+
   .toggle {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 6px;
     margin-bottom: 4px;
+  }
+
+  .toggle-control {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
   }
 
   .status {

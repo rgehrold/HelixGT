@@ -122,7 +122,14 @@ pub fn run_preflight(request: &PreflightRequest) -> Result<PreflightReport> {
     }
 
     if request.mode == PreflightMode::Align {
-        if request.reference_path.as_ref().is_none_or(|path| !path.is_file()) {
+        // Frontend passes a reference cache id (e.g. "escherichia_coli_k12" or
+        // "local:C:\path\to\ref.fa"), not always a filesystem path. The align
+        // command resolves ids via the reference store; only require a non-empty value here.
+        let has_reference = request
+            .reference_path
+            .as_ref()
+            .is_some_and(|path| !path.as_os_str().is_empty());
+        if !has_reference {
             issues.push(issue(
                 PreflightSeverity::Error,
                 "Alignment requires a loaded reference FASTA.",

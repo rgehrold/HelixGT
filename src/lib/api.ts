@@ -2,16 +2,23 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AlignSummary,
+  AlignmentDocument,
+  AnnotationDocument,
   ConvertProgress,
   ConvertSummary,
+  CoverageWindow,
   FastqQcSummary,
+  FeatureWindow,
   FormatInfo,
   MergeProgress,
   MergeSuggestion,
   MergeSummary,
   MergeValidation,
   PreflightResponse,
+  ReadsWindow,
   ReferenceFetchResult,
+  SequenceDocument,
+  SequenceSlice,
   ToolLogEvent,
   UserPreferences,
 } from "$lib/types";
@@ -99,4 +106,65 @@ export function onToolLog(handler: (payload: ToolLogEvent) => void) {
 
 export async function loadLocalReference(id: string, path: string) {
   return invoke<ReferenceFetchResult>("load_local_reference", { id, path });
+}
+
+export async function viewOpenDocument(path: string) {
+  return invoke<SequenceDocument>("view_open_document", { path });
+}
+
+export async function viewGetSequenceWindow(request: {
+  path: string;
+  contig: string;
+  start: number;
+  end: number;
+  reverseComplement?: boolean;
+}) {
+  return invoke<SequenceSlice>("view_get_sequence_window", { request });
+}
+
+export async function viewOpenAnnotation(path: string) {
+  return invoke<AnnotationDocument>("view_open_annotation", { path });
+}
+
+export async function viewGetFeaturesInRange(request: {
+  path: string;
+  contig: string;
+  start: number;
+  end: number;
+}) {
+  return invoke<FeatureWindow>("view_get_features_in_range", { request });
+}
+
+export async function viewOpenAlignment(request: {
+  path: string;
+  referencePath?: string | null;
+}) {
+  return invoke<AlignmentDocument>("view_open_alignment", { request });
+}
+
+export async function viewGetCoverageBins(request: {
+  path: string;
+  contig: string;
+  start: number;
+  end: number;
+  binCount?: number;
+  referencePath?: string | null;
+}) {
+  return invoke<CoverageWindow>("view_get_coverage_bins", { request });
+}
+
+export async function viewGetReadsInRange(request: {
+  path: string;
+  contig: string;
+  start: number;
+  end: number;
+  referencePath?: string | null;
+  includeSecondary?: boolean;
+  includeSupplementary?: boolean;
+  includeDuplicates?: boolean;
+  minMapq?: number;
+  /** Omit base/quality strings when false (faster for zoomed-out pileups). */
+  includeSequences?: boolean;
+}) {
+  return invoke<ReadsWindow>("view_get_reads_in_range", { request });
 }

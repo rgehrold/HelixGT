@@ -9,6 +9,7 @@ pub mod preflight;
 pub mod qc;
 pub mod reference_io;
 pub mod tools;
+pub mod view;
 
 pub use align::{
     align_reads_to_reference, output_alignment_path, AlignOptions, AlignOutputFormat, AlignResult,
@@ -43,3 +44,12 @@ pub use preflight::{
 };
 pub use qc::{fastq_qc, FastqQcSummary};
 pub use tools::{default_thread_count, helixgt_temp_dir, ToolPaths};
+pub use view::{
+    clear_annotation_cache, clear_sequence_cache, get_coverage_bins, get_features_in_range,
+    get_reads_in_range, get_reads_in_range_filtered, get_sequence_window, open_alignment_document,
+    open_annotation_document, open_sequence_document, AlignmentContig, AlignmentDocument,
+    AlignmentRead, AnnotationContigSpan, AnnotationDocument, AnnotationFeature, CigarOp, ContigInfo,
+    CoverageBin, CoverageWindow, FeatureWindow, ReadQueryOptions, ReadsWindow, SequenceDocument,
+    SequenceSlice, DEFAULT_COVERAGE_BINS, MAX_FEATURES_PER_WINDOW, MAX_READS_PER_WINDOW,
+    MAX_SEQUENCE_WINDOW,
+};

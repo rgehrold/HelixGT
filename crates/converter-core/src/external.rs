@@ -221,16 +221,16 @@ pub fn resolve_cram_reference(cram_path: &Path, explicit: Option<&Path>) -> Resu
     })
 }
 
-pub fn ensure_cram_index(samtools: &Path, cram_path: &Path, reference: &Path) -> Result<()> {
+pub fn ensure_cram_index(samtools: &Path, cram_path: &Path, _reference: &Path) -> Result<()> {
     let index_path = index_path_for(cram_path);
     if index_path.is_file() {
         return Ok(());
     }
-    let cram = cram_path.to_str().context("invalid CRAM path")?;
-    let reference_str = reference.to_str().context("invalid reference path")?;
-    let mut command = new_command(samtools);
-    command.args(["index", "-X", "cram", "-T", reference_str, cram]);
-    let _ = run_command(command, "samtools index");
+    // samtools index does not take -X/-T flags; indexing a CRAM is just `samtools index file.cram`.
+    // Failure is non-fatal: view can still decode with -T even without a .crai.
+    if let Err(error) = samtools_index(samtools, cram_path) {
+        eprintln!("warning: could not index CRAM '{}': {error:#}", cram_path.display());
+    }
     Ok(())
 }
 

@@ -1,8 +1,13 @@
-export const PANE_HANDLE_WIDTH_PX = 22;
-export const MIN_FILES_PANE_WIDTH_PX = 300;
+export const PANE_HANDLE_WIDTH_PX = 14;
+/** Allow the input browser to shrink so Tools/View get most of the width. */
+export const MIN_FILES_PANE_WIDTH_PX = 140;
 export const MIN_RIGHT_COLUMN_WIDTH_PX = 280;
-export const MIN_FILES_PANE_PERCENT = 32;
-export const MAX_FILES_PANE_PERCENT = 78;
+export const MIN_FILES_PANE_PERCENT = 10;
+export const MAX_FILES_PANE_PERCENT = 85;
+/** Drag left of this width (px) snaps the browser closed. */
+export const SNAP_COLLAPSE_FILES_PANE_PX = 96;
+/** Restored width when expanding from stash if none saved. */
+export const DEFAULT_EXPANDED_FILES_PANE_PERCENT = 28;
 
 export function clampFilesPaneWidth(percent: number, workspaceWidth: number): number {
   if (workspaceWidth <= 0) {
@@ -19,5 +24,17 @@ export function clampFilesPaneWidth(percent: number, workspaceWidth: number): nu
     (MIN_FILES_PANE_WIDTH_PX / workspaceWidth) * 100,
   );
 
-  return Math.min(maxPercent, Math.max(minPercent, percent));
+  // If the workspace is very narrow, min may exceed max — prefer min room for tools.
+  const lo = Math.min(minPercent, maxPercent);
+  const hi = Math.max(minPercent, maxPercent);
+  return Math.min(hi, Math.max(lo, percent));
+}
+
+export function filesPaneWidthPx(percent: number, workspaceWidth: number): number {
+  return (percent / 100) * workspaceWidth;
+}
+
+/** True when the drag position should snap the files pane closed. */
+export function shouldSnapCollapseFilesPane(clientX: number, workspaceLeft: number): boolean {
+  return clientX - workspaceLeft < SNAP_COLLAPSE_FILES_PANE_PX;
 }

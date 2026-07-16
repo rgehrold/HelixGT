@@ -28,7 +28,8 @@ fn gff_to_bed(input_path: &Path, output_path: &Path, options: &ConvertOptions) -
     for (index, result) in reader.record_bufs().enumerate() {
         let record = result.with_context(|| format!("invalid GFF record #{}", index + 1))?;
         let reference_sequence_name = record.reference_sequence_name().to_string();
-        let start = record.start().get();
+        // GFF is 1-based inclusive; BED is 0-based half-open.
+        let start = record.start().get().saturating_sub(1);
         let end = record.end().get();
         let name = record
             .attributes()
@@ -36,9 +37,15 @@ fn gff_to_bed(input_path: &Path, output_path: &Path, options: &ConvertOptions) -
             .or_else(|| record.attributes().get("Name"))
             .and_then(|value| value.as_string())
             .unwrap_or(".");
+        let strand = match record.strand() {
+            noodles::gff::record::Strand::Forward => "+",
+            noodles::gff::record::Strand::Reverse => "-",
+            noodles::gff::record::Strand::Unknown => "?",
+            noodles::gff::record::Strand::None => ".",
+        };
         writeln!(
             writer,
-            "{reference_sequence_name}\t{start}\t{end}\t{name}\t0\t+"
+            "{reference_sequence_name}\t{start}\t{end}\t{name}\t0\t{strand}"
         )
         .with_context(|| format!("failed to write BED record #{}", index + 1))?;
         count += 1;
@@ -67,13 +74,20 @@ fn bed_to_gff(input_path: &Path, output_path: &Path, options: &ConvertOptions) -
             continue;
         }
         let seq = fields[0];
-        let start = fields[1];
-        let end = fields[2];
+        // BED is 0-based half-open; GFF is 1-based inclusive.
+        let bed_start: u64 = fields[1]
+            .parse()
+            .with_context(|| format!("invalid BED start on line #{line_index}"))?;
+        let bed_end: u64 = fields[2]
+            .parse()
+            .with_context(|| format!("invalid BED end on line #{line_index}"))?;
+        let gff_start = bed_start.saturating_add(1);
+        let gff_end = bed_end.max(gff_start);
         let name = fields.get(3).copied().unwrap_or("feature");
         let strand = fields.get(5).copied().unwrap_or(".");
         writeln!(
             writer,
-            "{seq}\thelixgt\tregion\t{start}\t{end}\t.\t{strand}\t.\tID={name}"
+            "{seq}\thelixgt\tregion\t{gff_start}\t{gff_end}\t.\t{strand}\t.\tID={name}"
         )
         .with_context(|| format!("failed to write GFF record from BED line #{line_index}"))?;
         count += 1;
