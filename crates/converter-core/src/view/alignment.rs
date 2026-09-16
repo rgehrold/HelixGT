@@ -1,10 +1,10 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
-use noodles::sam::alignment::record::{QualityScores as QualTrait, Sequence as SeqTrait};
+use std::process::{Command, Stdio};
+use noodles::sam::alignment::record::QualityScores as QualTrait;
 
 use anyhow::{bail, Context, Result};
 use noodles::bam;
@@ -285,18 +285,10 @@ pub fn get_coverage_bins_filtered(
     if start >= end {
         bail!("invalid window: start ({start}) must be < end ({end})");
     }
-    let bins_n = bin_count.clamp(1, MAX_COVERAGE_BINS);
+    let bins_n = bin_count.clamp(1, MAX_COVERAGE_BINS).min((end - start).min(usize::MAX as u64) as usize);
 
     if is_bam(path) {
         return get_coverage_bins_bam(path, contig, start, end, bins_n, options);
-    }
-
-    if is_cram(path) {
-        if let Ok(window) =
-            get_coverage_bins_cram(path, contig, start, end, bins_n, reference_path, options)
-        {
-            return Ok(window);
-        }
     }
 
     get_coverage_bins_via_samtools_view(
@@ -326,25 +318,10 @@ pub fn get_alignment_window(
     if start >= end {
         bail!("invalid window: start ({start}) must be < end ({end})");
     }
-    let bins_n = bin_count.clamp(1, MAX_COVERAGE_BINS);
+    let bins_n = bin_count.clamp(1, MAX_COVERAGE_BINS).min((end - start).min(usize::MAX as u64) as usize);
 
     if is_bam(path) {
         return get_alignment_window_bam(path, contig, start, end, bins_n, options, include_reads);
-    }
-
-    if is_cram(path) {
-        if let Ok(window) = get_alignment_window_cram(
-            path,
-            contig,
-            start,
-            end,
-            bins_n,
-            reference_path,
-            options,
-            include_reads,
-        ) {
-            return Ok(window);
-        }
     }
 
     let coverage = get_coverage_bins_via_samtools_view(
@@ -378,44 +355,33 @@ pub fn get_overview_coverage(
     if contig_length == 0 {
         bail!("contig length is 0");
     }
-    let bins_n = bin_count.clamp(16, MAX_COVERAGE_BINS);
+    let bins_n = bin_count.clamp(16, MAX_COVERAGE_BINS).min(contig_length.min(usize::MAX as u64) as usize);
     let tiles = OVERVIEW_TILES.min(bins_n).max(1);
-    let mut delta = vec![0i32; bins_n + 1];
-
+    let mut bins = Vec::with_capacity(bins_n);
+    let mut max_depth = 0.0f64;
+    // Partition on bin boundaries and clip boundary-crossing reads per tile.
     for tile in 0..tiles {
-        let t0 = (tile as u64 * contig_length) / tiles as u64;
-        let t1 = ((tile as u64 + 1) * contig_length) / tiles as u64;
-        if t1 <= t0 {
-            continue;
-        }
+        let first = tile * bins_n / tiles;
+        let last = (tile + 1) * bins_n / tiles;
+        let t0 = (first as u128 * contig_length as u128 / bins_n as u128) as u64;
+        let t1 = (last as u128 * contig_length as u128 / bins_n as u128) as u64;
+        let tile_bins = last - first;
         let mut tile_opts = options.clone();
         tile_opts.include_sequences = false;
-        if is_bam(path) {
-            let _ = accumulate_coverage_bam(path, contig, t0, t1, bins_n, 0, contig_length, &mut delta, &tile_opts, MAX_OVERVIEW_READS_PER_TILE);
+        let win = if is_bam(path) {
+            let mut delta = vec![0.0f64; tile_bins + 1];
+            accumulate_coverage_bam(path, contig, t0, t1, tile_bins, t0, t1,
+                &mut delta, &tile_opts, MAX_OVERVIEW_READS_PER_TILE)?;
+            finalize_coverage_from_delta(contig, t0, t1, tile_bins, &delta)
         } else {
-            let win = get_coverage_bins_filtered(
-                path,
-                tool_paths,
-                contig,
-                t0,
-                t1,
-                (bins_n / tiles).max(4),
-                reference_path,
-                &tile_opts,
-            );
-            if let Ok(win) = win {
-                for bin in win.bins {
-                    mark_read_on_bins(bin.start, bin.end, 0, contig_length, bins_n, &mut delta);
-                    // Depth is already a count; re-marking as 1-per-bin undercounts.
-                    // Prefer native BAM path above. For CRAM fallback the tile histogram
-                    // is approximate — good enough for a sparkline.
-                    let _ = bin.depth;
-                }
-            }
-        }
+            get_coverage_bins_filtered(path, tool_paths, contig, t0, t1,
+                tile_bins, reference_path, &tile_opts)?
+        };
+        max_depth = max_depth.max(win.max_depth);
+        bins.extend(win.bins);
     }
-
-    Ok(finalize_coverage_from_delta(contig, 0, contig_length, bins_n, &delta))
+    Ok(CoverageWindow { contig: contig.to_string(), start: 0,
+        end: contig_length, bins, max_depth })
 }
 
 fn empty_reads_window(contig: &str, start: u64, end: u64) -> ReadsWindow {
@@ -469,12 +435,6 @@ pub fn get_reads_in_range_filtered(
 
     if is_bam(path) {
         return get_reads_bam(path, contig, start, end, options);
-    }
-
-    if is_cram(path) {
-        if let Ok(window) = get_reads_cram(path, contig, start, end, reference_path, options) {
-            return Ok(window);
-        }
     }
 
     get_reads_samtools(path, tool_paths, contig, start, end, reference_path, options)
@@ -545,7 +505,7 @@ fn get_coverage_bins_bam(
     bins_n: usize,
     options: &ReadQueryOptions,
 ) -> Result<CoverageWindow> {
-    let mut delta = vec![0i32; bins_n + 1];
+    let mut delta = vec![0.0f64; bins_n + 1];
     accumulate_coverage_bam(
         path,
         contig,
@@ -577,7 +537,7 @@ fn accumulate_coverage_bam(
     bins_n: usize,
     window_start: u64,
     window_end: u64,
-    delta: &mut [i32],
+    delta: &mut [f64],
     options: &ReadQueryOptions,
     max_scan: usize,
 ) -> Result<usize> {
@@ -662,7 +622,7 @@ fn get_alignment_window_bam(
             .query(&handle.header, &region)
             .with_context(|| format!("BAM query failed for {resolved}:{start}-{end}"))?;
 
-        let mut delta = vec![0i32; bins_n + 1];
+        let mut delta = vec![0.0f64; bins_n + 1];
         let mut reads = Vec::new();
         let mut total = 0u64;
         let mut scanned = 0usize;
@@ -795,13 +755,12 @@ fn mark_record_coverage(
     window_start: u64,
     window_end: u64,
     bins_n: usize,
-    delta: &mut [i32],
+    delta: &mut [f64],
 ) {
     let Some(Ok(aln_start)) = record.alignment_start() else {
         return;
     };
     let mut ref_pos = (usize::from(aln_start) as u64).saturating_sub(1);
-    let mut marked_any = false;
     for result in record.cigar().iter() {
         let Ok(op) = result else {
             continue;
@@ -814,7 +773,6 @@ fn mark_record_coverage(
             | CigarKind::Deletion => {
                 mark_read_on_bins(ref_pos, ref_pos.saturating_add(len), window_start, window_end, bins_n, delta);
                 ref_pos = ref_pos.saturating_add(len);
-                marked_any = true;
             }
             CigarKind::Skip => {
                 ref_pos = ref_pos.saturating_add(len);
@@ -822,14 +780,7 @@ fn mark_record_coverage(
             CigarKind::Insertion | CigarKind::SoftClip | CigarKind::HardClip | CigarKind::Pad => {}
         }
     }
-    if !marked_any {
-        let span = AlignmentRecord::alignment_span(record)
-            .and_then(|r| r.ok())
-            .unwrap_or(1)
-            .max(1) as u64;
-        let start = (usize::from(aln_start) as u64).saturating_sub(1);
-        mark_read_on_bins(start, start.saturating_add(span), window_start, window_end, bins_n, delta);
-    }
+
 }
 
 fn read_bam_contigs(path: &Path) -> Result<Vec<AlignmentContig>> {
@@ -1038,7 +989,7 @@ fn genomic_to_bin(pos: u64, window_start: u64, window_end: u64, bins_n: usize) -
         return bins_n;
     }
     let off = pos - window_start;
-    ((off as u128 * bins_n as u128) / span as u128) as usize
+    (((off as u128 + 1) * bins_n as u128 - 1) / span as u128) as usize
 }
 
 /// Count M/=/X/D spans; skip N (introns).
@@ -1048,10 +999,9 @@ fn mark_cigar_coverage(
     window_start: u64,
     window_end: u64,
     bins_n: usize,
-    delta: &mut [i32],
+    delta: &mut [f64],
 ) {
     let mut ref_pos = aln_start;
-    let mut marked = false;
     for op in ops {
         let len = op.length as u64;
         match op.op.as_str() {
@@ -1065,7 +1015,6 @@ fn mark_cigar_coverage(
                     delta,
                 );
                 ref_pos = ref_pos.saturating_add(len);
-                marked = true;
             }
             "N" => {
                 ref_pos = ref_pos.saturating_add(len);
@@ -1073,59 +1022,57 @@ fn mark_cigar_coverage(
             _ => {}
         }
     }
-    if !marked {
-        let span = cigar_ops_reference_length(ops).max(1);
-        mark_read_on_bins(
-            aln_start,
-            aln_start.saturating_add(span),
-            window_start,
-            window_end,
-            bins_n,
-            delta,
-        );
-    }
+
 }
 
-/// O(1) per read: +1 at start bin, −1 at end bin (exclusive). Prefix-sum later.
+/// O(1) per aligned block: partial edge bins plus a difference-array range
+/// for fully covered bins. Depth is mean aligned bases per base, independent
+/// of zoom, read length, or how the CIGAR splits a match into operations.
 fn mark_read_on_bins(
-    s: u64,
-    e: u64,
-    window_start: u64,
-    window_end: u64,
-    bins_n: usize,
-    delta: &mut [i32],
+    s: u64, e: u64, window_start: u64, window_end: u64,
+    bins_n: usize, delta: &mut [f64],
 ) {
-    if e <= window_start || s >= window_end || bins_n == 0 || delta.len() < bins_n + 1 {
+    if window_end <= window_start || e <= window_start || s >= window_end
+        || bins_n == 0 || delta.len() < bins_n + 1 {
         return;
     }
     let from = s.max(window_start);
     let to = e.min(window_end);
-    if to <= from {
-        return;
-    }
-    let i0 = genomic_to_bin(from, window_start, window_end, bins_n).min(bins_n - 1);
-    let i1 = genomic_to_bin(to, window_start, window_end, bins_n).min(bins_n);
-    delta[i0] += 1;
-    if i1 < bins_n {
-        delta[i1] -= 1;
+    if to <= from { return; }
+    let span = window_end - window_start;
+    let boundary = |i: usize| window_start
+        + (i as u128 * span as u128 / bins_n as u128) as u64;
+    let first = genomic_to_bin(from, window_start, window_end, bins_n);
+    let last = genomic_to_bin(to - 1, window_start, window_end, bins_n);
+    let mut add = |i: usize, value: f64| {
+        delta[i] += value;
+        delta[i + 1] -= value;
+    };
+    if first == last {
+        add(first, (to - from) as f64 / (boundary(first + 1) - boundary(first)) as f64);
+    } else {
+        add(first, (boundary(first + 1) - from) as f64 / (boundary(first + 1) - boundary(first)) as f64);
+        add(last, (to - boundary(last)) as f64 / (boundary(last + 1) - boundary(last)) as f64);
+        delta[first + 1] += 1.0;
+        delta[last] -= 1.0;
     }
 }
 
-/// Prefix-sum delta → per-bin overlapping-read counts (simple coverage histogram).
+/// Prefix-sum delta to mean depth in each non-overlapping genomic bin.
 fn finalize_coverage_from_delta(
     contig: &str,
     start: u64,
     end: u64,
     bins_n: usize,
-    delta: &[i32],
+    delta: &[f64],
 ) -> CoverageWindow {
     let span = (end - start).max(1);
     let mut bins = Vec::with_capacity(bins_n);
     let mut max_depth = 0.0f64;
-    let mut run = 0i32;
+    let mut run = 0.0f64;
     for i in 0..bins_n {
-        run += delta.get(i).copied().unwrap_or(0);
-        let depth = f64::from(run.max(0));
+        run += delta.get(i).copied().unwrap_or(0.0);
+        let depth = run.max(0.0);
         max_depth = max_depth.max(depth);
         let b_start = start + (i as u64 * span) / bins_n as u64;
         let b_end = if i + 1 == bins_n {
@@ -1148,324 +1095,10 @@ fn finalize_coverage_from_delta(
     }
 }
 
-// ── Native CRAM (noodles + CRAI) ────────────────────────────────────────────
-
-fn fai_sidecar(fasta: &Path) -> PathBuf {
-    let mut s = std::ffi::OsString::from(fasta.as_os_str());
-    s.push(".fai");
-    PathBuf::from(s)
-}
-
-fn fasta_repository_for_cram(reference: &Path) -> Result<noodles::fasta::Repository> {
-    use noodles::fasta;
-    let fai_path = fai_sidecar(reference);
-    let index = if fai_path.is_file() {
-        fasta::fai::read(&fai_path)
-            .with_context(|| format!("failed to read FASTA index '{}'", fai_path.display()))?
-    } else {
-        fasta::io::index(reference).with_context(|| {
-            format!(
-                "CRAM viewing needs a .fai next to the reference '{}'. Run samtools faidx.",
-                reference.display()
-            )
-        })?
-    };
-    let reader = fasta::io::indexed_reader::Builder::default()
-        .set_index(index)
-        .build_from_path(reference)
-        .with_context(|| format!("failed to open indexed FASTA '{}'", reference.display()))?;
-    let adapter = fasta::repository::adapters::IndexedReader::new(reader);
-    Ok(fasta::Repository::new(adapter))
-}
-
-fn open_indexed_cram(
-    path: &Path,
-    reference_path: Option<&Path>,
-) -> Result<(noodles::cram::io::IndexedReader<File>, SamHeader)> {
-    use noodles::cram;
-    let mut builder = cram::io::indexed_reader::Builder::default();
-    if let Some(reference) = reference_path {
-        builder = builder.set_reference_sequence_repository(fasta_repository_for_cram(reference)?);
-    }
-    let mut reader = builder.build_from_path(path).with_context(|| {
-        format!(
-            "failed to open indexed CRAM '{}'. Ensure a .crai exists and a reference FASTA is set.",
-            path.display()
-        )
-    })?;
-    let header = reader
-        .read_header()
-        .with_context(|| format!("failed to read CRAM header: {}", path.display()))?;
-    Ok((reader, header))
-}
-
-fn get_coverage_bins_cram(
-    path: &Path,
-    contig: &str,
-    start: u64,
-    end: u64,
-    bins_n: usize,
-    reference_path: Option<&Path>,
-    options: &ReadQueryOptions,
-) -> Result<CoverageWindow> {
-    let (mut reader, header) = open_indexed_cram(path, reference_path)?;
-    let resolved = resolve_bam_contig(&header, contig)?;
-    let region = make_region(&resolved, start, end)?;
-    let query = reader
-        .query(&header, &region)
-        .with_context(|| format!("CRAM query failed for {resolved}:{start}-{end}"))?;
-    let mut delta = vec![0i32; bins_n + 1];
-    let cap = coverage_scan_cap(end.saturating_sub(start));
-    let mut scanned = 0usize;
-    for result in query {
-        let record = result.context("invalid CRAM record during coverage scan")?;
-        if scanned >= cap {
-            break;
-        }
-        let Some(read) = cram_record_to_alignment_read(&record, &header, true) else {
-            continue;
-        };
-        if !passes_filters(&read, options) {
-            continue;
-        }
-        scanned += 1;
-        mark_cigar_coverage(&read.cigar_ops, read.start, start, end, bins_n, &mut delta);
-    }
-    Ok(finalize_coverage_from_delta(&resolved, start, end, bins_n, &delta))
-}
-
-fn get_reads_cram(
-    path: &Path,
-    contig: &str,
-    start: u64,
-    end: u64,
-    reference_path: Option<&Path>,
-    options: &ReadQueryOptions,
-) -> Result<ReadsWindow> {
-    let (mut reader, header) = open_indexed_cram(path, reference_path)?;
-    let resolved = resolve_bam_contig(&header, contig)?;
-    let region = make_region(&resolved, start, end)?;
-    let query = reader
-        .query(&header, &region)
-        .with_context(|| format!("CRAM query failed for {resolved}:{start}-{end}"))?;
-    let max_keep = max_reads_to_keep(end.saturating_sub(start), options.include_sequences);
-    let mut reads = Vec::new();
-    let mut total = 0u64;
-    for result in query {
-        let record = result.context("invalid CRAM record during read fetch")?;
-        let Some(read) = cram_record_to_alignment_read(&record, &header, options.include_sequences)
-        else {
-            continue;
-        };
-        if !passes_filters(&read, options) {
-            continue;
-        }
-        if read.end <= start || read.start >= end {
-            continue;
-        }
-        total += 1;
-        reservoir_push(&mut reads, read, total, max_keep);
-    }
-    finish_reads_window(&resolved, start, end, reads, total)
-}
-
-fn get_alignment_window_cram(
-    path: &Path,
-    contig: &str,
-    start: u64,
-    end: u64,
-    bins_n: usize,
-    reference_path: Option<&Path>,
-    options: &ReadQueryOptions,
-    include_reads: bool,
-) -> Result<AlignmentWindow> {
-    let (mut reader, header) = open_indexed_cram(path, reference_path)?;
-    let resolved = resolve_bam_contig(&header, contig)?;
-    let region = make_region(&resolved, start, end)?;
-    let query = reader
-        .query(&header, &region)
-        .with_context(|| format!("CRAM query failed for {resolved}:{start}-{end}"))?;
-    let max_keep = max_reads_to_keep(end.saturating_sub(start), options.include_sequences);
-    let cap = coverage_scan_cap(end.saturating_sub(start));
-    let mut delta = vec![0i32; bins_n + 1];
-    let mut reads = Vec::new();
-    let mut total = 0u64;
-    let mut scanned = 0usize;
-    for result in query {
-        let record = result.context("invalid CRAM record during alignment window scan")?;
-        let Some(read) = cram_record_to_alignment_read(
-            &record,
-            &header,
-            options.include_sequences || true, // need CIGAR for coverage (no N)
-        ) else {
-            continue;
-        };
-        if !passes_filters(&read, options) {
-            continue;
-        }
-        if scanned < cap {
-            mark_cigar_coverage(&read.cigar_ops, read.start, start, end, bins_n, &mut delta);
-        }
-        scanned += 1;
-        if include_reads && read.end > start && read.start < end {
-            total += 1;
-            let stored = if options.include_sequences {
-                read
-            } else {
-                strip_read_detail(read, false)
-            };
-            reservoir_push(&mut reads, stored, total, max_keep);
-        }
-    }
-    let coverage = finalize_coverage_from_delta(&resolved, start, end, bins_n, &delta);
-    let reads = if include_reads {
-        finish_reads_window(&resolved, start, end, reads, total)?
-    } else {
-        empty_reads_window(&resolved, start, end)
-    };
-    Ok(AlignmentWindow { coverage, reads })
-}
-
-fn cram_record_to_alignment_read(
-    record: &noodles::cram::Record,
-    header: &SamHeader,
-    include_sequences: bool,
-) -> Option<AlignmentRead> {
-    use noodles::sam::alignment::Record as _;
-    let flags = record.flags();
-    if flags.is_unmapped() {
-        return None;
-    }
-    let aln_start = record.alignment_start()?;
-    let start = (usize::from(aln_start) as u64).saturating_sub(1);
-    let (cigar_ops, cigar_str) = if include_sequences {
-        cram_cigar(record)
-    } else {
-        (Vec::new(), String::new())
-    };
-    let span = if cigar_ops.is_empty() {
-        record
-            .alignment_span()
-            .and_then(|r| r.ok())
-            .unwrap_or(1)
-            .max(1) as u64
-    } else {
-        cigar_ops_reference_length(&cigar_ops).max(1)
-    };
-    let end = start.saturating_add(span);
-    let mapq = record.mapping_quality().map(|mq| mq.get()).unwrap_or(255);
-    let name = record
-        .name()
-        .map(|n| String::from_utf8_lossy(n.as_ref()).into_owned())
-        .unwrap_or_else(|| "*".to_string());
-    let (sequence, qualities) = if include_sequences {
-        (cram_sequence(record), cram_qualities(record))
-    } else {
-        (String::new(), String::new())
-    };
-    let mate_start = record
-        .mate_alignment_start()
-        .map(|p| (usize::from(p) as u64).saturating_sub(1));
-    let mate_contig = match record.mate_reference_sequence_id(header) {
-        Some(Ok(id)) => header
-            .reference_sequences()
-            .get_index(id)
-            .map(|(n, _)| String::from_utf8_lossy(n).into_owned())
-            .unwrap_or_default(),
-        _ => String::new(),
-    };
-    Some(AlignmentRead {
-        name,
-        start,
-        end,
-        strand: if flags.is_reverse_complemented() {
-            "-".to_string()
-        } else {
-            "+".to_string()
-        },
-        mapq,
-        cigar: cigar_str,
-        cigar_ops,
-        flags: flags.bits(),
-        sequence,
-        qualities,
-        is_paired: flags.is_segmented(),
-        is_proper_pair: flags.is_properly_segmented(),
-        is_unmapped: flags.is_unmapped(),
-        is_mate_unmapped: flags.is_mate_unmapped(),
-        is_reverse: flags.is_reverse_complemented(),
-        is_secondary: flags.is_secondary(),
-        is_supplementary: flags.is_supplementary(),
-        is_duplicate: flags.is_duplicate(),
-        is_qc_fail: flags.is_qc_fail(),
-        is_first_in_pair: flags.is_first_segment(),
-        is_second_in_pair: flags.is_last_segment(),
-        template_length: record.template_length(),
-        mate_contig,
-        mate_start,
-    })
-}
-
-fn cram_cigar(record: &noodles::cram::Record) -> (Vec<CigarOp>, String) {
-    let mut ops = Vec::new();
-    let mut cigar = String::new();
-    for result in record.cigar().iter() {
-        let Ok(op) = result else {
-            continue;
-        };
-        let ch = cigar_kind_char(op.kind());
-        let len = op.len() as u32;
-        cigar.push_str(&len.to_string());
-        cigar.push(ch);
-        ops.push(CigarOp {
-            op: ch.to_string(),
-            length: len,
-        });
-    }
-    if cigar.is_empty() {
-        cigar = "*".to_string();
-    }
-    (ops, cigar)
-}
-
-fn cram_sequence(record: &noodles::cram::Record) -> String {
-    let seq = record.sequence();
-    if SeqTrait::is_empty(&seq) {
-        return String::new();
-    }
-    let mut out = String::with_capacity(SeqTrait::len(&seq));
-    for base in SeqTrait::iter(&seq) {
-        out.push(match base {
-            b'A' | b'a' => 'A',
-            b'C' | b'c' => 'C',
-            b'G' | b'g' => 'G',
-            b'T' | b't' => 'T',
-            b'N' | b'n' => 'N',
-            other if other.is_ascii_alphabetic() => (other as char).to_ascii_uppercase(),
-            _ => 'N',
-        });
-    }
-    out
-}
-
-fn cram_qualities(record: &noodles::cram::Record) -> String {
-    let scores = record.quality_scores();
-    if QualTrait::is_empty(&scores) {
-        return String::new();
-    }
-    let mut out = String::with_capacity(QualTrait::len(&scores));
-    for result in QualTrait::iter(&scores) {
-        let Ok(q) = result else {
-            out.push('5');
-            continue;
-        };
-        let phred = q.min(93);
-        out.push(char::from(phred + 33));
-    }
-    out
-}
-
-// ── CRAM / samtools fallback ────────────────────────────────────────────────
+// CRAM uses bundled samtools for genuinely region-bounded CRAI queries.
+// noodles-cram 0.73 Query::read_next_container filters only reference ID,
+// decoding every indexed container on that chromosome before filtering records.
+// Never put that decoder back on the interactive path without a bounded-query test.
 
 fn resolve_path_contig(
     path: &Path,
@@ -1487,6 +1120,38 @@ fn resolve_path_contig(
     })
 }
 
+/// Stream query output while draining diagnostics concurrently. A failed tool
+/// must never be reported as a successful empty (or partial) genomic window.
+fn stream_samtools_query(mut command: Command, mut visit: impl FnMut(&str) -> bool) -> Result<()> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn().context("failed to run samtools view")?;
+    let stdout = child.stdout.take().context("missing samtools stdout")?;
+    let mut stderr = child.stderr.take().context("missing samtools stderr")?;
+    let diagnostics = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.by_ref().take(64 * 1024).read_to_string(&mut text);
+        let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+        text
+    });
+    let mut stopped = false;
+    let result: Result<()> = (|| {
+        for line in BufReader::with_capacity(256 * 1024, stdout).lines() {
+            let line = line.context("failed reading samtools view output")?;
+            if !visit(&line) { stopped = true; break; }
+        }
+        Ok(())
+    })();
+    if stopped || result.is_err() { let _ = child.kill(); }
+    let status = child.wait().context("failed waiting for samtools view");
+    let stderr = diagnostics.join().unwrap_or_default();
+    result?;
+    let status = status?;
+    if !stopped && !status.success() {
+        bail!("samtools view failed ({status}): {}", stderr.trim());
+    }
+    Ok(())
+}
+
 fn get_coverage_bins_via_samtools_view(
     path: &Path,
     tool_paths: &ToolPaths,
@@ -1499,8 +1164,7 @@ fn get_coverage_bins_via_samtools_view(
 ) -> Result<CoverageWindow> {
     let samtools = resolve_samtools(tool_paths)?;
     ensure_indexed(path, &samtools)?;
-    let resolved = resolve_path_contig(path, tool_paths, contig, reference_path)
-        .unwrap_or_else(|_| contig.to_string());
+    let resolved = resolve_path_contig(path, tool_paths, contig, reference_path)?;
 
     let region = format_region(&resolved, start, end);
     let mut command = new_command(&samtools);
@@ -1511,36 +1175,28 @@ fn get_coverage_bins_via_samtools_view(
         }
     }
     command.arg(path).arg(&region);
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let mut child = command.spawn().context("failed to run samtools view")?;
-    let stdout = child.stdout.take().context("missing samtools stdout")?;
-    let reader = BufReader::with_capacity(256 * 1024, stdout);
-
-    let mut delta = vec![0i32; bins_n + 1];
+    let mut delta = vec![0.0f64; bins_n + 1];
     let mut scanned = 0usize;
     let cap = coverage_scan_cap(end.saturating_sub(start));
 
-    for line in reader.lines() {
-        let line = line.context("failed reading samtools view output")?;
+    stream_samtools_query(command, |line| {
         if line.starts_with('@') || line.is_empty() {
-            continue;
+            return true;
         }
         if scanned >= cap {
-            break;
+            return false;
         }
         let Some(read) = parse_sam_alignment_line(&line) else {
-            continue;
+            return true;
         };
         if !passes_filters(&read, options) {
-            continue;
+            return true;
         }
         scanned += 1;
         mark_cigar_coverage(&read.cigar_ops, read.start, start, end, bins_n, &mut delta);
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
+        true
+    })?;
 
     Ok(finalize_coverage_from_delta(&resolved, start, end, bins_n, &delta))
 }
@@ -1556,8 +1212,7 @@ fn get_reads_samtools(
 ) -> Result<ReadsWindow> {
     let samtools = resolve_samtools(tool_paths)?;
     ensure_indexed(path, &samtools)?;
-    let resolved = resolve_path_contig(path, tool_paths, contig, reference_path)
-        .unwrap_or_else(|_| contig.to_string());
+    let resolved = resolve_path_contig(path, tool_paths, contig, reference_path)?;
 
     let region = format_region(&resolved, start, end);
     let mut command = new_command(&samtools);
@@ -1569,28 +1224,22 @@ fn get_reads_samtools(
         }
     }
     command.arg(path).arg(&region);
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-    let mut child = command.spawn().context("failed to run samtools view")?;
-    let stdout = child.stdout.take().context("missing samtools stdout")?;
-    let reader = BufReader::with_capacity(256 * 1024, stdout);
 
     let max_keep = max_reads_to_keep(end.saturating_sub(start), options.include_sequences);
     let mut reads = Vec::new();
     let mut total = 0u64;
-    for line in reader.lines() {
-        let line = line.context("failed reading samtools view output")?;
+    stream_samtools_query(command, |line| {
         if line.starts_with('@') || line.is_empty() {
-            continue;
+            return true;
         }
         let Some(read) = parse_sam_alignment_line(&line) else {
-            continue;
+            return true;
         };
         if !passes_filters(&read, options) {
-            continue;
+            return true;
         }
         if read.end <= start || read.start >= end {
-            continue;
+            return true;
         }
         total += 1;
         reservoir_push(
@@ -1599,10 +1248,8 @@ fn get_reads_samtools(
             total,
             max_keep,
         );
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
+        true
+    })?;
 
     finish_reads_window(&resolved, start, end, reads, total)
 }
@@ -1823,6 +1470,90 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cram_indexed_region_returns_only_requested_reads_and_depth() {
+        let samtools = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../src-tauri/binaries/samtools.exe");
+        if !samtools.is_file() { return; }
+        let dir = tempfile::tempdir().unwrap();
+        let reference = dir.path().join("reference.fa");
+        let sam = dir.path().join("reads.sam");
+        let cram = dir.path().join("reads.cram");
+        std::fs::write(&reference, format!(">chr1\n{}\n>chr2\n{}\n", "A".repeat(1000), "A".repeat(1000))).unwrap();
+        std::fs::write(&sam, concat!(
+            "@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:chr1\tLN:1000\n@SQ\tSN:chr2\tLN:1000\n",
+            "inside\t0\tchr1\t11\t60\t10M\t*\t0\t0\tAAAAAAAAAA\tIIIIIIIIII\n",
+            "outside\t0\tchr1\t101\t60\t10M\t*\t0\t0\tAAAAAAAAAA\tIIIIIIIIII\n",
+            "other\t0\tchr2\t11\t60\t10M\t*\t0\t0\tAAAAAAAAAA\tIIIIIIIIII\n"
+        )).unwrap();
+        let mut index_ref = new_command(&samtools);
+        index_ref.arg("faidx").arg(&reference);
+        crate::external::run_command(index_ref, "samtools faidx").unwrap();
+        let mut encode = new_command(&samtools);
+        encode.arg("view").args(["-C", "-T"]).arg(&reference).arg("-o").arg(&cram).arg(&sam);
+        crate::external::run_command(encode, "samtools encode").unwrap();
+        samtools_index(&samtools, &cram).unwrap();
+        let tools = ToolPaths { samtools: Some(samtools), minimap2: None };
+        let options = ReadQueryOptions { include_sequences: true, ..Default::default() };
+        let reads = get_reads_in_range_filtered(&cram, &tools, "1", 10, 20, Some(&reference), &options).unwrap();
+        assert_eq!(reads.total_in_range, 1);
+        assert_eq!(reads.reads[0].name, "inside");
+        assert_eq!(reads.reads[0].sequence, "AAAAAAAAAA");
+        let cov = get_coverage_bins_filtered(&cram, &tools, "chr1", 0, 30, 3, Some(&reference), &options).unwrap();
+        assert_eq!(cov.bins.iter().map(|b| b.depth).collect::<Vec<_>>(), vec![0.0, 1.0, 0.0]);
+        assert!(get_reads_in_range_filtered(&cram, &tools, "missing", 0, 10, Some(&reference), &options).is_err());
+        // The process wrapper must propagate decoder failures rather than
+        // reporting an empty successful query.
+        let mut invalid = new_command(tools.samtools.as_ref().unwrap());
+        invalid.arg("view").arg(dir.path().join("missing.cram"));
+        let error = stream_samtools_query(invalid, |_| true).unwrap_err();
+        assert!(error.to_string().contains("samtools view failed"));
+    }
+
+    #[test]
+    fn coverage_matches_per_base_oracle_at_all_bin_widths() {
+        // Uneven bins, reads contained in one bin, clipped reads and exact
+        // boundaries must preserve the same number of aligned bases.
+        for span in 1..30u64 {
+            for bins_n in 1..=span as usize {
+                let mut delta = vec![0.0; bins_n + 1];
+                let mut bases = vec![0u32; span as usize];
+                for (start, end) in [(0, 3), (4, 7), (6, 11), (8, 50), (12, 12)] {
+                    mark_read_on_bins(start, end, 5, 5 + span, bins_n, &mut delta);
+                    for pos in start.max(5)..end.min(5 + span) {
+                        bases[(pos - 5) as usize] += 1;
+                    }
+                }
+                let cov = finalize_coverage_from_delta("chr1", 5, 5 + span, bins_n, &delta);
+                for bin in cov.bins {
+                    let sum: u32 = bases[(bin.start - 5) as usize..(bin.end - 5) as usize].iter().sum();
+                    let expected = sum as f64 / (bin.end - bin.start) as f64;
+                    assert!((bin.depth - expected).abs() < 1e-9,
+                        "span={span}, bins={bins_n}, bin={bin:?}, expected={expected}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn coverage_is_independent_of_cigar_segmentation() {
+        let mut whole = vec![0.0; 4];
+        let mut split = vec![0.0; 4];
+        mark_cigar_coverage(&parse_cigar_ops("10M"), 1, 0, 20, 3, &mut whole);
+        mark_cigar_coverage(&parse_cigar_ops("3M2I2=1X4M"), 1, 0, 20, 3, &mut split);
+        for (a, b) in whole.iter().zip(&split) { assert!((a - b).abs() < 1e-9); }
+    }
+
+    #[test]
+    fn introns_and_clips_do_not_contribute_depth() {
+        let mut delta = vec![0.0; 11];
+        mark_cigar_coverage(&parse_cigar_ops("2S2M4N2M2S"), 0, 0, 10, 10, &mut delta);
+        mark_cigar_coverage(&parse_cigar_ops("10N"), 0, 0, 10, 10, &mut delta);
+        let cov = finalize_coverage_from_delta("chr1", 0, 10, 10, &delta);
+        let depths: Vec<_> = cov.bins.iter().map(|b| b.depth).collect();
+        assert_eq!(depths, vec![1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
     fn cigar_ref_length_basic() {
         assert_eq!(cigar_ops_reference_length(&parse_cigar_ops("8M")), 8);
         assert_eq!(cigar_ops_reference_length(&parse_cigar_ops("4M2D4M")), 10);
@@ -1866,7 +1597,7 @@ mod tests {
 
     #[test]
     fn difference_array_marks_bins() {
-        let mut delta = vec![0i32; 3];
+        let mut delta = vec![0.0f64; 3];
         // Read covering [0, 10) with 2 bins over [0, 10) → both bins.
         mark_read_on_bins(0, 10, 0, 10, 2, &mut delta);
         let cov = finalize_coverage_from_delta("chr1", 0, 10, 2, &delta);

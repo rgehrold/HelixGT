@@ -1,9 +1,8 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { open } from "@tauri-apps/plugin-dialog";
   import InfoLink from "$lib/components/InfoLink.svelte";
   import {
-    viewGetAlignmentWindow,
     viewGetCoverageBins,
     viewGetFeaturesInRange,
     viewGetOverviewCoverage,
@@ -49,7 +48,6 @@
     computeReadFetchWindow,
     coverageCacheCovers,
     coverageCacheDenseEnough,
-    coverageNearEdge,
     desiredCoverageBinCount,
     maxDepthInView,
     readCacheCanDisplay,
@@ -114,6 +112,8 @@
   type CoverageCache = {
     path: string;
     contig: string;
+    /** Filters alter depth, so coverage must never be shared across them. */
+    filterKey: string;
     start: number;
     end: number;
     binCount: number;
@@ -140,6 +140,8 @@
     coverageCache: CoverageCache | null;
     overviewBins: CoverageBin[];
     overviewMax: number;
+    /** Filters alter the whole-contig depth profile as well. */
+    overviewFilterKey: string;
     alignmentReads: AlignmentRead[];
     readsTruncated: boolean;
     readsTotal: number;
@@ -217,6 +219,8 @@
   let panOriginX = $state(0);
   let panOriginStart = $state(0);
 
+  let showOverviewDepth = $state(false);
+  let disposed = false;
   let fetchToken = 0;
   let featureFetchToken = 0;
   let alignFetchToken = 0;
@@ -413,7 +417,7 @@
       contigLength,
       visibleBp,
     );
-    const binCount = desiredCoverageBinCount(end - start, plotWidth);
+    const binCount = desiredCoverageBinCount(end - start, plotWidth, visibleBp);
     return { start, end, binCount };
   }
 
@@ -477,7 +481,9 @@
   // Viewport / filter-driven data load. Do NOT read annTrackStates here —
   // feature results write that array and would re-trigger an infinite fetch loop
   // (UI stuck on "fetching…" while hammering IPC).
-  let lastRc = reverseComplement;
+  // The initial orientation is always forward; keep this plain value rather
+  // than capturing a reactive state value during component construction.
+  let lastRc = false;
   $effect(() => {
     if (!hasDocument || !contig || contigLength <= 0) return;
     viewStart;
@@ -493,6 +499,8 @@
     featureTypeFilter;
     // Track annotation *document* list (open/close), not per-track feature arrays.
     annDocs;
+    referencePath;
+    showOverviewDepth;
     if (reverseComplement !== lastRc) {
       lastRc = reverseComplement;
       localBuffer = null;
@@ -503,10 +511,14 @@
       schedulePaint();
       return;
     }
-    if (seqDoc) refreshVisibleSlice();
-    if (featureDebounceTimer) clearTimeout(featureDebounceTimer);
-    featureDebounceTimer = setTimeout(() => void refreshFeatures(), FEATURE_FETCH_DEBOUNCE_MS);
-    refreshAlignmentTracksDebounced();
+    // Cache/result reads are implementation details, not load-effect dependencies.
+    untrack(() => {
+      if (seqDoc) refreshVisibleSlice();
+      if (featureDebounceTimer) clearTimeout(featureDebounceTimer);
+      featureDebounceTimer = setTimeout(() => void refreshFeatures(), FEATURE_FETCH_DEBOUNCE_MS);
+      applyAlignmentFromCaches();
+      refreshAlignmentTracksDebounced();
+    });
   });
 
   $effect(() => {
@@ -533,6 +545,7 @@
     colorReadsBy;
     colorMismatches;
     colorBases;
+    showOverviewDepth;
     plotWidth;
     // While navigating, paint is already scheduled from setViewStart/markNavigating —
     // avoid a second full reactive storm from every dependency listed above.
@@ -649,6 +662,10 @@
     window.addEventListener("blur", onWindowBlur);
     document.addEventListener("visibilitychange", onVisibility);
     return () => {
+      disposed = true;
+      fetchToken++;
+      featureFetchToken++;
+      alignFetchToken++;
       window.removeEventListener("resize", onResize);
       window.removeEventListener("helixgt-theme", onTheme);
       window.removeEventListener("pointerup", onWindowPointerEnd, true);
@@ -756,7 +773,7 @@
         bins: t.coverageBins,
         maxDepth: t.coverageMax,
       })),
-      overviewBins: overviewSrc?.overviewBins ?? [],
+      overviewBins: showOverviewDepth ? (overviewSrc?.overviewBins ?? []) : [],
       overviewMax: overviewSrc?.overviewMax ?? 0,
       isFetchingAlign,
       annTracks: annTrackStates
@@ -940,6 +957,7 @@
         coverageCache: null,
         overviewBins: [],
         overviewMax: 0,
+        overviewFilterKey: "",
         alignmentReads: [],
         readsTruncated: false,
         readsTotal: 0,
@@ -1259,6 +1277,11 @@
   async function loadBuffer(start: number, end: number, updateVisible: boolean) {
     if (!seqDoc || !contig || end <= start) return;
     const token = ++fetchToken;
+    const requestedPath = seqDoc.path;
+    const requestedContig = contig;
+    const requestedRc = reverseComplement;
+    const current = () => token === fetchToken && seqDoc?.path === requestedPath
+      && contig === requestedContig && reverseComplement === requestedRc;
     // Only surface “fetching…” for visible loads — background prefetch must not
     // thrash Svelte re-renders of the whole pane (and the rest of the app).
     if (updateVisible) isFetchingSlice = true;
@@ -1270,9 +1293,9 @@
         end,
         reverseComplement,
       });
-      if (token !== fetchToken) return;
+      if (!current()) return;
       await yieldToBrowser();
-      if (token !== fetchToken) return;
+      if (!current()) return;
       const incoming: LocalBuffer = {
         contig,
         start: next.start,
@@ -1297,13 +1320,13 @@
           } satisfies SequenceSlice);
       }
     } catch (error) {
-      if (token !== fetchToken) return;
+      if (!current()) return;
       // Keep any existing buffer/slice so the track does not blink empty.
       if (updateVisible && !sliceFromLocalBuffer()) {
         onLog(`Sequence fetch failed: ${String(error)}`, "warn");
       }
     } finally {
-      if (token === fetchToken && updateVisible) isFetchingSlice = false;
+      if (token === fetchToken) isFetchingSlice = false;
     }
   }
 
@@ -1323,10 +1346,16 @@
     const start = Math.max(0, viewStart - pad);
     const end = Math.min(contigLength, viewEnd + pad);
     const token = ++featureFetchToken;
+    const docs = [...annDocs];
+    const requestedContig = contig;
+    const requestedFilter = featureTypeFilter;
+    const current = () => token === featureFetchToken && contig === requestedContig
+      && featureTypeFilter === requestedFilter && docs.length === annDocs.length
+      && docs.every((doc, i) => doc === annDocs[i]);
     isFetchingFeatures = true;
     try {
       const windows = await Promise.all(
-        annDocs.map((doc) =>
+        docs.map((doc) =>
           viewGetFeaturesInRange({
             path: doc.path,
             contig,
@@ -1336,8 +1365,8 @@
           }),
         ),
       );
-      if (token !== featureFetchToken) return;
-      const nextTracks: AnnTrackState[] = annDocs.map((doc, i) => {
+      if (!current()) return;
+      const nextTracks: AnnTrackState[] = docs.map((doc, i) => {
         const existing = annTrackStates.find((t) => t.path === doc.path);
         const label = existing?.label ?? doc.path.split(/[\\/]/).pop() ?? doc.path;
         const window = windows[i]!;
@@ -1355,7 +1384,7 @@
       });
       annTrackStates = nextTracks;
     } catch (error) {
-      if (token !== featureFetchToken) return;
+      if (!current()) return;
       onLog(`Feature fetch failed: ${String(error)}`, "warn");
     } finally {
       if (token === featureFetchToken) isFetchingFeatures = false;
@@ -1364,7 +1393,7 @@
 
   function alignmentFilterKey(includeSequences: boolean): string {
     return (
-      readFilterKey({
+      referencePath.trim() + "|" + readFilterKey({
         hideSecondary,
         hideSupplementary,
         hideDuplicates,
@@ -1382,16 +1411,21 @@
     };
   }
 
-  function trackNeedsNetwork(t: AlignTrackState, needSeq: boolean, filters: string): boolean {
+  function trackNeedsNetwork(
+    t: AlignTrackState,
+    needSeq: boolean,
+    readFilters: string,
+    coverageFilters: string,
+  ): boolean {
     const wantReads = showReadPileup && visibleBp <= READ_FETCH_MAX_BP;
     const readsHit =
       !wantReads ||
-      readCacheUsable(t.readCache, t.path, contig, filters, viewStart, viewEnd, needSeq);
+      readCacheUsable(t.readCache, t.path, contig, readFilters, viewStart, viewEnd, needSeq);
     const covHit =
       !showCoverage ||
-      (coverageCacheCovers(t.coverageCache, t.path, contig, viewStart, viewEnd) &&
-        coverageCacheDenseEnough(t.coverageCache, viewStart, viewEnd, plotWidth) &&
-        !(t.coverageCache && coverageNearEdge(t.coverageCache, viewStart, viewEnd, visibleBp)));
+      (t.coverageCache?.filterKey === coverageFilters &&
+        coverageCacheCovers(t.coverageCache, t.path, contig, viewStart, viewEnd) &&
+        coverageCacheDenseEnough(t.coverageCache, viewStart, viewEnd, plotWidth));
     return (showCoverage && !covHit) || (wantReads && !readsHit);
   }
 
@@ -1402,22 +1436,49 @@
     if (viewportBusy()) return;
 
     const needSeq = visibleBp <= READ_SEQUENCES_MAX_BP;
-    const filters = alignmentFilterKey(needSeq);
-    const needsWork = alignTracks.some((t) => trackNeedsNetwork(t, needSeq, filters));
-    if (!needsWork && alignTracks.every((t) => t.overviewBins.length > 0)) return;
+    const readFilters = alignmentFilterKey(needSeq);
+    // Sequence payload is irrelevant to depth, so crossing the read-detail zoom
+    // threshold must not trigger a new coverage or overview scan.
+    const coverageFilters = alignmentFilterKey(false);
+    const needsWork = alignTracks.some((t) =>
+      trackNeedsNetwork(t, needSeq, readFilters, coverageFilters),
+    );
+    if (
+      !needsWork &&
+      (!showOverviewDepth || alignTracks.every(
+        (t) => t.overviewFilterKey === coverageFilters,
+      ))
+    ) return;
     alignDebounceTimer = setTimeout(() => void refreshAlignmentTracks(), FETCH_DEBOUNCE_IDLE_MS);
   }
 
-  function applyTrackFromCaches(t: AlignTrackState, needSeq: boolean, filters: string): AlignTrackState {
+  function applyTrackFromCaches(
+    t: AlignTrackState,
+    needSeq: boolean,
+    readFilters: string,
+    coverageFilters: string,
+  ): AlignTrackState {
     const wantReads = showReadPileup && visibleBp <= READ_FETCH_MAX_BP;
     let next = t;
-    if (showCoverage && t.coverageCache && coverageCacheCovers(t.coverageCache, t.path, contig, viewStart, viewEnd)) {
+    // A stale depth graph is worse than a short loading gap: its values no
+    // longer match the visible MAPQ/flag controls. Keep the cache object for
+    // comparison, but do not paint it until a matching result arrives.
+    if (t.overviewFilterKey !== coverageFilters && t.overviewBins.length > 0) {
+      next = { ...next, overviewBins: [], overviewMax: 0 };
+    }
+    if (
+      showCoverage &&
+      t.coverageCache?.filterKey === coverageFilters &&
+      coverageCacheCovers(t.coverageCache, t.path, contig, viewStart, viewEnd)
+    ) {
       const bins = t.coverageCache.bins.filter((b) => b.end > viewStart && b.start < viewEnd);
       next = {
         ...next,
         coverageBins: bins,
         coverageMax: maxDepthInView(bins, viewStart, viewEnd),
       };
+    } else if (showCoverage && (t.coverageBins.length > 0 || t.coverageMax > 0)) {
+      next = { ...next, coverageBins: [], coverageMax: 0 };
     }
     if (!wantReads) {
       return {
@@ -1427,7 +1488,7 @@
         readsTotal: 0,
       };
     }
-    if (t.readCache && readCacheCanDisplay(t.readCache, t.path, contig, filters, viewStart, viewEnd)) {
+    if (t.readCache && readCacheCanDisplay(t.readCache, t.path, contig, readFilters, viewStart, viewEnd)) {
       const overlap = readsOverlapWindow(t.readCache.reads, viewStart, viewEnd);
       next = {
         ...next,
@@ -1435,6 +1496,8 @@
         readsTruncated: t.readCache.truncated,
         readsTotal: Math.max(t.readCache.totalInRange, overlap.length),
       };
+    } else if (t.alignmentReads.length > 0) {
+      next = { ...next, alignmentReads: [], readsTruncated: false, readsTotal: 0 };
     }
     return next;
   }
@@ -1442,219 +1505,126 @@
   function applyAlignmentFromCaches() {
     if (alignTracks.length === 0 || !contig) return;
     const needSeq = visibleBp <= READ_SEQUENCES_MAX_BP;
-    const filters = alignmentFilterKey(needSeq);
-    alignTracks = alignTracks.map((t) => applyTrackFromCaches(t, needSeq, filters));
+    const readFilters = alignmentFilterKey(needSeq);
+    const coverageFilters = alignmentFilterKey(false);
+    alignTracks = alignTracks.map((t) =>
+      applyTrackFromCaches(t, needSeq, readFilters, coverageFilters),
+    );
+    if (selectedRead && !alignTracks.some((t) => t.alignmentReads.some((r) =>
+      r.name === selectedRead!.name && r.start === selectedRead!.start && r.flags === selectedRead!.flags))) {
+      selectedRead = null;
+    }
     if (!viewportBusy()) recomputeReadPack();
   }
 
-  async function refreshAlignmentTracks() {
-    if (alignTracks.length === 0 || !contig || contigLength <= 0) {
-      return;
-    }
-    if (viewportBusy()) {
-      applyAlignmentFromCaches();
-      return;
-    }
-    if (isFetchingAlign) {
-      alignFetchNeedsRerun = true;
-      return;
-    }
+  const overviewRequests = new Map<string, string>();
 
+  // Overview scans must never delay local coverage/pileup or the next pan.
+  async function refreshOverview(t: AlignTrackState, requestedContig: string,
+    length: number, filters: string, ref: string | null, opts: ReturnType<typeof filterOpts>) {
+    const key = `${requestedContig}|${filters}`;
+    if (!showOverviewDepth || t.overviewFilterKey === filters || overviewRequests.has(t.path)) return;
+    overviewRequests.set(t.path, key);
+    const current = () => !disposed && contig === requestedContig
+      && showOverviewDepth && alignmentFilterKey(false) === filters && alignTracks.some((track) => track.doc === t.doc);
+    try {
+      const ov = await viewGetOverviewCoverage({ path: t.path, contig: requestedContig,
+        contigLength: length, binCount: OVERVIEW_BINS, referencePath: ref, ...opts });
+      if (!current()) return;
+      alignTracks = alignTracks.map((track) => track === t || track.doc === t.doc
+        ? { ...track, overviewBins: ov.bins, overviewMax: ov.maxDepth, overviewFilterKey: filters }
+        : track);
+      schedulePaint();
+    } catch (error) {
+      if (current()) {
+        // Mark this attempt so a failed overview cannot create an automatic retry loop.
+        alignTracks = alignTracks.map((track) => track.doc === t.doc
+          ? { ...track, overviewFilterKey: filters } : track);
+        onLog(`Overview unavailable (${t.label}): ${String(error)}`, "warn");
+      }
+    } finally {
+      overviewRequests.delete(t.path);
+      if (!disposed && !current()) refreshAlignmentTracksDebounced();
+    }
+  }
+
+  async function refreshAlignmentTracks() {
+    if (disposed) return;
+    if (alignTracks.length === 0 || !contig || contigLength <= 0) return;
+    if (viewportBusy()) { applyAlignmentFromCaches(); return; }
+    if (isFetchingAlign) { alignFetchNeedsRerun = true; return; }
     clampWindow();
     const token = ++alignFetchToken;
+    const requestedContig = contig;
+    const requestedLength = contigLength;
     const includeSequences = visibleBp <= READ_SEQUENCES_MAX_BP;
-    const filters = alignmentFilterKey(includeSequences);
+    const readFilters = alignmentFilterKey(includeSequences);
+    const coverageFilters = alignmentFilterKey(false);
     const covPlan = coveragePlanForView();
+    const readWin = computeReadFetchWindow(viewStart, viewEnd, contigLength, visibleBp);
     const wantReads = showReadPileup && visibleBp <= READ_FETCH_MAX_BP;
     const opts = filterOpts();
-
+    const reference = referencePath.trim() || null;
+    const current = () => token === alignFetchToken && contig === requestedContig
+      && alignmentFilterKey(false) === coverageFilters;
+    applyAlignmentFromCaches();
+    const tracks = [...alignTracks];
+    isFetchingAlign = true;
     try {
-      applyAlignmentFromCaches();
-      const work = alignTracks.filter((t) => trackNeedsNetwork(t, includeSequences, filters) || t.overviewBins.length === 0);
-      if (work.length === 0) return;
-
-      isFetchingAlign = true;
-      const updated = [...alignTracks];
-
-      await Promise.all(
-        work.map(async (t) => {
-          const idx = updated.findIndex((x) => x.path === t.path);
-          if (idx < 0) return;
-          const ref =
-            t.doc.requiresReference && referencePath.trim() ? referencePath.trim() : null;
-          const readsHit = !wantReads || readCacheUsable(t.readCache, t.path, contig, filters, viewStart, viewEnd, includeSequences);
-          const covHit =
-            showCoverage &&
-            coverageCacheCovers(t.coverageCache, t.path, contig, viewStart, viewEnd) &&
-            coverageCacheDenseEnough(t.coverageCache, viewStart, viewEnd, plotWidth);
-
-          try {
-            if (showCoverage && wantReads && !readsHit) {
-              const readWin = computeReadFetchWindow(viewStart, viewEnd, contigLength, visibleBp);
-              const win = await viewGetAlignmentWindow({
-                path: t.path,
-                contig,
-                start: Math.min(covPlan.start, readWin.start),
-                end: Math.max(covPlan.end, readWin.end),
-                binCount: covPlan.binCount,
-                referencePath: ref,
-                ...opts,
-                includeSequences,
-                includeReads: true,
-              });
-              if (token !== alignFetchToken) return;
-              const covCache: CoverageCache = {
-                path: t.path,
-                contig,
-                start: covPlan.start,
-                end: covPlan.end,
-                binCount: covPlan.binCount,
-                bins: win.coverage.bins,
-                maxDepth: win.coverage.maxDepth,
-              };
-              const bins = win.coverage.bins.filter((b) => b.end > viewStart && b.start < viewEnd);
-              updated[idx] = {
-                ...updated[idx]!,
-                coverageCache: covCache,
-                coverageBins: bins,
-                coverageMax: maxDepthInView(bins, viewStart, viewEnd),
-                readCache: {
-                  path: t.path,
-                  contig,
-                  start: readWin.start,
-                  end: readWin.end,
-                  filterKey: filters,
-                  reads: win.reads.reads,
-                  totalInRange: win.reads.totalInRange,
-                  truncated: win.reads.truncated,
-                  hasSequences: includeSequences,
-                },
-                alignmentReads: readsOverlapWindow(win.reads.reads, viewStart, viewEnd),
-                readsTruncated: win.reads.truncated,
-                readsTotal: win.reads.totalInRange,
-              };
-            } else {
-              if (showCoverage && !covHit) {
-                const cov = await viewGetCoverageBins({
-                  path: t.path,
-                  contig,
-                  start: covPlan.start,
-                  end: covPlan.end,
-                  binCount: covPlan.binCount,
-                  referencePath: ref,
-                  ...opts,
-                });
-                if (token !== alignFetchToken) return;
-                const bins = cov.bins.filter((b) => b.end > viewStart && b.start < viewEnd);
-                updated[idx] = {
-                  ...updated[idx]!,
-                  coverageCache: {
-                    path: t.path,
-                    contig,
-                    start: covPlan.start,
-                    end: covPlan.end,
-                    binCount: covPlan.binCount,
-                    bins: cov.bins,
-                    maxDepth: cov.maxDepth,
-                  },
-                  coverageBins: bins,
-                  coverageMax: maxDepthInView(bins, viewStart, viewEnd),
-                };
-              }
-              if (wantReads && !readsHit) {
-                const readWin = computeReadFetchWindow(viewStart, viewEnd, contigLength, visibleBp);
-                const reads = await viewGetReadsInRange({
-                  path: t.path,
-                  contig,
-                  start: readWin.start,
-                  end: readWin.end,
-                  referencePath: ref,
-                  ...opts,
-                  includeSequences,
-                });
-                if (token !== alignFetchToken) return;
-                const cur = updated[idx]!;
-                updated[idx] = {
-                  ...cur,
-                  readCache: {
-                    path: t.path,
-                    contig,
-                    start: readWin.start,
-                    end: readWin.end,
-                    filterKey: filters,
-                    reads: reads.reads,
-                    totalInRange: reads.totalInRange,
-                    truncated: reads.truncated,
-                    hasSequences: includeSequences,
-                  },
-                  alignmentReads: readsOverlapWindow(reads.reads, viewStart, viewEnd),
-                  readsTruncated: reads.truncated,
-                  readsTotal: reads.totalInRange,
-                };
-              }
-            }
-
-            const cur = updated[idx]!;
-            if (cur.overviewBins.length === 0 && contigLength > 0) {
-              try {
-                const ov = await viewGetOverviewCoverage({
-                  path: t.path,
-                  contig,
-                  contigLength,
-                  binCount: OVERVIEW_BINS,
-                  referencePath: ref,
-                  ...opts,
-                });
-                if (token !== alignFetchToken) return;
-                updated[idx] = {
-                  ...updated[idx]!,
-                  overviewBins: ov.bins,
-                  overviewMax: ov.maxDepth,
-                };
-              } catch {
-                /* non-fatal */
-              }
-            }
-          } catch (error) {
-            if (token !== alignFetchToken) return;
-            onLog(`Alignment track failed (${t.label}): ${String(error)}`, "warn");
+      await Promise.all(tracks.map(async (t) => {
+        const ref = t.doc.requiresReference ? reference : null;
+        const readsHit = !wantReads || readCacheUsable(t.readCache, t.path, requestedContig,
+          readFilters, viewStart, viewEnd, includeSequences);
+        const covHit = !showCoverage || (t.coverageCache?.filterKey === coverageFilters
+          && coverageCacheCovers(t.coverageCache, t.path, requestedContig, viewStart, viewEnd)
+          && coverageCacheDenseEnough(t.coverageCache, viewStart, viewEnd, plotWidth));
+        try {
+          // Keep read queries tight: sampling the padded coverage window can
+          // discard most reads at the actual locus and inflate sequence payloads.
+          const [covResult, readsResult] = await Promise.allSettled([
+            covHit ? null : viewGetCoverageBins({ path: t.path, contig: requestedContig,
+              ...covPlan, referencePath: ref, ...opts }),
+            readsHit ? null : viewGetReadsInRange({ path: t.path, contig: requestedContig,
+              ...readWin, referencePath: ref, ...opts, includeSequences }),
+          ]);
+          if (!current()) return;
+          for (const result of [covResult, readsResult]) {
+            if (result.status === "rejected") onLog(`Alignment track failed (${t.label}): ${String(result.reason)}`, "warn");
           }
-        }),
-      );
-
-      if (token !== alignFetchToken) return;
-      await yieldToBrowser();
-      if (token !== alignFetchToken) return;
-      alignTracks = updated;
-      if (selectedRead) {
-        const still = alignTracks
-          .flatMap((t) => t.alignmentReads)
-          .find(
-            (r) =>
-              r.name === selectedRead!.name &&
-              r.start === selectedRead!.start &&
-              r.flags === selectedRead!.flags,
-          );
-        selectedRead = still ?? null;
-      }
-      recomputeReadPack();
-    } catch (error) {
-      if (token !== alignFetchToken) return;
-      onLog(`Alignment track failed: ${String(error)}`, "warn");
+          const cov = covResult.status === "fulfilled" ? covResult.value : null;
+          const reads = readsResult.status === "fulfilled" ? readsResult.value : null;
+          // Merge into current tracks, preserving additions, removals and visibility.
+          alignTracks = alignTracks.map((track) => track.doc !== t.doc ? track : {
+            ...track,
+            coverageCache: cov ? { path: t.path, contig: requestedContig,
+              filterKey: coverageFilters, start: cov.start, end: cov.end,
+              binCount: cov.bins.length, bins: cov.bins, maxDepth: cov.maxDepth } : track.coverageCache,
+            readCache: reads ? { path: t.path, contig: requestedContig,
+              start: reads.start, end: reads.end, filterKey: readFilters,
+              reads: reads.reads, totalInRange: reads.totalInRange,
+              truncated: reads.truncated, hasSequences: includeSequences } : track.readCache,
+          });
+          applyAlignmentFromCaches();
+          schedulePaint();
+          const track = alignTracks.find((track) => track.doc === t.doc);
+          if (track) void refreshOverview(track, requestedContig, requestedLength, coverageFilters, ref, opts);
+        } catch (error) {
+          if (current()) onLog(`Alignment track failed (${t.label}): ${String(error)}`, "warn");
+        }
+      }));
     } finally {
       if (token === alignFetchToken) {
         isFetchingAlign = false;
+        if (!current()) alignFetchNeedsRerun = true;
         applyAlignmentFromCaches();
         schedulePaint();
         if (alignFetchNeedsRerun) {
           alignFetchNeedsRerun = false;
-          if (!viewportBusy()) void refreshAlignmentTracks();
-          else alignFetchNeedsRerun = true;
+          refreshAlignmentTracksDebounced();
         }
       }
     }
   }
-
 
   function selectRead(read: AlignmentRead) {
     selectedRead = read;
@@ -1734,7 +1704,12 @@
   }
 
   function applyLocusFromInput() {
-    const parsed = parseLocus(locusInput, contig, contigLength);
+    const colon = locusInput.indexOf(":");
+    const requested = colon >= 0 ? locusInput.slice(0, colon).trim() || contig : contig;
+    const target = resolveContigName(contigOptions.map((c) => c.name), requested);
+    if (!target) { onLog(`Unknown contig: ${requested}`, "warn"); return; }
+    const targetLength = contigOptions.find((c) => c.name === target)?.length ?? 0;
+    const parsed = parseLocus(locusInput, target, targetLength);
     if (!parsed.ok) {
       onLog(`Locus: ${parsed.message}`, "warn");
       if (contig) locusInput = formatLocus(contig, viewStart, viewEnd);
@@ -1745,7 +1720,7 @@
         contigOptions.map((c) => c.name),
         parsed.contig,
       );
-      if (resolved) contig = resolved;
+      if (resolved) onContigChange(resolved);
       else {
         onLog(`Unknown contig: ${parsed.contig}`, "warn");
         return;
@@ -1819,6 +1794,9 @@
     selectionEnd = null;
     selectedFeature = null;
     selectedRead = null;
+    selectedCoverage = null;
+    slice = null;
+    annTrackStates = annTrackStates.map((t) => ({ ...t, features: [], truncated: false, totalInRange: 0 }));
     localBuffer = null;
     alignTracks = alignTracks.map((t) => ({
       ...t,
@@ -1826,6 +1804,7 @@
       coverageCache: null,
       overviewBins: [],
       overviewMax: 0,
+      overviewFilterKey: "",
       alignmentReads: [],
       coverageBins: [],
       coverageMax: 0,
@@ -2197,6 +2176,7 @@
               <label class="pop-check"><input type="checkbox" bind:checked={colorBases} /> Letters on mismatch bases (reads)</label>
             {/if}
             {#if alignDoc}
+              <label class="pop-check" title="Optional whole-contig scan; leave off for fastest local navigation"><input type="checkbox" bind:checked={showOverviewDepth} /> Whole-contig depth overview</label>
               <label class="pop-check"><input type="checkbox" bind:checked={colorMismatches} /> Mismatch &amp; indel highlights</label>
             {/if}
             <p class="pop-hint">Use ▾ / ▸ in the track gutter to collapse or expand tracks. Coverage is depth (grey) only.</p>

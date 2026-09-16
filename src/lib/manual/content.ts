@@ -653,7 +653,7 @@ export const MANUAL_PAGES: ManualPage[] = [
         items: [
           "Coordinate-sorted alignments.",
           "Index present: .bam.bai / .bai / .csi for BAM, .cram.crai / .crai for CRAM.",
-          "CRAM also needs a reference FASTA (reference field or right-click → Set as reference). That FASTA is loaded onto the Reference track. Indexed CRAM is queried natively when possible; otherwise samtools is used.",
+          "CRAM also needs a reference FASTA (reference field or right-click → Set as reference). That FASTA is loaded onto the Reference track. Indexed CRAM uses the bundled samtools reader for region-bounded queries.",
           "Large references (e.g. hg38): use an uncompressed FASTA with a .fai index (samtools faidx). Files larger than 512 MB without a .fai are refused (building a human-genome index would freeze the app).",
           "Chromosome names should match the alignment (chr1 vs 1). HelixGT aliases common forms (chr1 ↔ 1, chrM ↔ MT) for FASTA, BAM/CRAM, GFF/BED, and the locus box.",
         ],
@@ -739,7 +739,7 @@ export const MANUAL_PAGES: ManualPage[] = [
     blocks: [
       {
         type: "p",
-        text: "Histogram of read depth from the indexed BAM/CRAM (native noodles + BAI for BAM; native CRAM or samtools view for CRAM). Y-scale follows the viewport-local maximum (with a small floor). The overview strip shows a coarse whole-contig sparkline. Click a bar for bin depth details.",
+        text: "Histogram of mean read depth per genomic bin from indexed BAM/CRAM (native noodles + BAI for BAM; samtools view + CRAI for CRAM). Partial-bin overlaps contribute proportionally; CIGAR N (introns) is excluded and deletions count toward depth. Y-scale follows the viewport-local maximum (with a small floor). The whole-contig depth overview is off by default to prioritize local tracks. Enable it in Display when needed; it loads separately and can take longer on large files. The overview and coverage windows wider than 2 Mb may be scan-limited estimates; zoom in for local depth. Click a bar for bin depth details.",
       },
       {
         type: "note",

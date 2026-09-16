@@ -263,6 +263,7 @@ pub fn get_features_in_range_filtered(
     let hi = indices.partition_point(|&i| cached.features[i].start < end);
 
     let mut matches = Vec::new();
+    let mut total_in_range = 0u64;
     for &idx in &indices[lo..hi] {
         let feature = &cached.features[idx];
         if feature.end <= start {
@@ -273,14 +274,13 @@ pub fn get_features_in_range_filtered(
                 continue;
             }
         }
-        matches.push(feature.clone());
+        total_in_range += 1;
+        if matches.len() < MAX_FEATURES_PER_WINDOW {
+            matches.push(feature.clone());
+        }
     }
 
-    let total_in_range = matches.len() as u64;
-    let truncated = matches.len() > MAX_FEATURES_PER_WINDOW;
-    if truncated {
-        matches.truncate(MAX_FEATURES_PER_WINDOW);
-    }
+    let truncated = total_in_range > matches.len() as u64;
 
     Ok(FeatureWindow {
         contig: resolved,
@@ -397,6 +397,26 @@ fn load_bed_features(path: &Path) -> Result<Vec<AnnotationFeature>> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn capped_query_preserves_total_and_type_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dense.bed");
+        let total = MAX_FEATURES_PER_WINDOW + 123;
+        let mut file = std::fs::File::create(&path).unwrap();
+        for i in 0..total {
+            writeln!(file, "chr1\t{i}\t{}\tf{i}", i + 10).unwrap();
+        }
+        drop(file);
+        let result = get_features_in_range(&path, "chr1", 0, total as u64 + 10).unwrap();
+        assert_eq!(result.features.len(), MAX_FEATURES_PER_WINDOW);
+        assert_eq!(result.total_in_range, total as u64);
+        assert!(result.truncated);
+        let filtered = get_features_in_range_filtered(&path, "chr1", 0,
+            total as u64 + 10, Some(&["gene".to_string()])).unwrap();
+        assert_eq!(filtered.total_in_range, 0);
+        assert!(!filtered.truncated);
+    }
 
     #[test]
     fn loads_gff_and_queries_range() {

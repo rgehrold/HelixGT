@@ -1,6 +1,6 @@
 # HelixGT
 
-A native Windows desktop app for genomics file conversion, merging, and read alignment. Built with **Rust**, **Tauri**, **Svelte**, and **noodles**, with **minimap2** and **samtools** for alignment and CRAM support.
+A native Windows desktop genomics workbench for visual locus browsing, file analysis, format conversion, merging, and read alignment. Built with **Rust**, **Tauri**, **Svelte**, and **noodles**, with **minimap2** and **samtools** for alignment and CRAM support.
 
 ## Features
 
@@ -36,7 +36,9 @@ Browse sequence, annotation, and alignment files on a linear track (IGV-style):
 
 Right-click a supported file → **Open in View**, or use the **View** mode tab.
 
-BAM/CRAM must be coordinate-sorted and indexed (`.bai` / `.crai`). CRAM needs a reference FASTA (Convert reference field).
+Coverage reports mean depth per bin, including fractional overlaps and excluding introns. CRAM uses bundled samtools for indexed regional queries. Whole-contig depth is opt-in under **Display → Whole-contig depth overview** and loads independently of local tracks. The overview and windows wider than 2 Mb may be scan-limited estimates.
+
+BAM/CRAM must be coordinate-sorted and indexed (`.bai` / `.crai`). CRAM needs a reference FASTA, selected in View or through **Set as reference** in the explorer.
 
 ### Align
 
@@ -78,7 +80,7 @@ The first run compiles Rust dependencies and may take several minutes.
 | Command | When to use | What happens |
 |---------|-------------|--------------|
 | `npm run tauri dev` | Daily development | Rebuilds only what changed; hot-reloads the Svelte UI |
-| `npm run tauri build` | Release build only | Builds installer under `src-tauri/target/release/bundle/` |
+| `npm run tauri build` | Release build only | Builds installer under `target/release/bundle/` |
 | `npm run release` | **Sharing / installers** | Builds, then copies installer + portable exe into a top-level **`dist/`** folder |
 | `npm run collect-release` | After a build already finished | Only re-copies artifacts into `dist/` (no rebuild) |
 
@@ -97,8 +99,8 @@ HelixGT/
 
 Raw Tauri paths (if you need them):
 
-- Portable exe: `src-tauri/target/release/HelixGT.exe`
-- Installers: `src-tauri/target/release/bundle/nsis/` and `…/bundle/msi/`
+- Portable exe: `target/release/HelixGT.exe`
+- Installers: `target/release/bundle/nsis/` and `…/bundle/msi/`
 
 During development you usually leave `tauri dev` running. Edit Svelte files and the UI refreshes automatically. Rust changes trigger a quick rebuild of the backend.
 
@@ -134,3 +136,11 @@ The built-in file explorer lets you browse, rename, and reveal output files. Act
 ## License
 
 MIT
+## Verification
+
+- `npm run check` — Svelte / TypeScript diagnostics.
+- `npm test` — viewer coordinate, cache, fetch-window, and read-packing regressions.
+- `cargo test -p converter-core` — engine regressions, including coverage against a per-base oracle and concurrent subprocess output.
+- `cargo check -p helixgt` — desktop command integration.
+
+See [the project review](PROJECT_REVIEW.md) for findings, remaining limitations, and suggested next improvements.

@@ -31,7 +31,7 @@ export const READ_SEQUENCES_MAX_BP = 1_500;
 export const PER_BASE_COVERAGE_MAX_BP = 0;
 
 /** Hard cap on coverage bins per request (~screen width). */
-export const MAX_COVERAGE_BINS = 1_024;
+export const MAX_COVERAGE_BINS = 4_096;
 
 /**
  * Floor for auto coverage Y-scale (viewport-local max, at least this).

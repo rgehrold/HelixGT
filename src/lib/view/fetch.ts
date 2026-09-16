@@ -12,9 +12,10 @@ import {
  * Coverage resolution: always ~one bin per screen pixel (cheap histogram).
  * Engine uses a difference-array scan — O(reads + bins), not per-base.
  */
-export function desiredCoverageBinCount(_windowSpanBp: number, plotWidth?: number): number {
+export function desiredCoverageBinCount(windowSpanBp: number, plotWidth?: number, visibleBp = windowSpanBp): number {
   const px = Math.max(40, Math.floor(plotWidth ?? 640));
-  return Math.min(MAX_COVERAGE_BINS, px);
+  const paddedPixels = Math.ceil(px * windowSpanBp / Math.max(1, visibleBp));
+  return Math.max(1, Math.min(MAX_COVERAGE_BINS, windowSpanBp, paddedPixels));
 }
 
 /**
@@ -78,11 +79,15 @@ export function computeCoverageFetchWindow(
   contigLength: number,
   visibleBp: number,
 ): { start: number; end: number } {
+  // A fetch cap must not trim away the viewport itself at chromosome scale.
+  if (viewEnd - viewStart >= COV_FETCH_CHUNK_MAX_BP) {
+    return { start: viewStart, end: contigLength > 0 ? Math.min(contigLength, viewEnd) : viewEnd };
+  }
   const vp = Math.max(1, COV_CACHE_VIEWPORTS);
   // Half the extra viewports on each side, plus an absolute floor for short windows.
   const padFromViewports = Math.floor((visibleBp * (vp - 1)) / 2);
   const pad = Math.max(
-    Math.min(COV_CACHE_PAD_BP, Math.max(8_000, Math.floor(visibleBp * 0.5))),
+    Math.min(COV_CACHE_PAD_BP, Math.max(1, Math.floor(visibleBp * 0.5))),
     padFromViewports,
   );
   let start = Math.max(0, viewStart - pad);

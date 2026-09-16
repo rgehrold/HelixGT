@@ -170,10 +170,23 @@ pub fn merge_files(
         anyhow::bail!("{}", validation.message);
     }
 
+    let name = options.output_name.trim();
+    if name.is_empty() || name == "." || name == ".."
+        || name.contains(['/', '\\', ':']) || Path::new(name).is_absolute() {
+        anyhow::bail!("Merge output must be a filename inside the chosen output folder.");
+    }
+
     std::fs::create_dir_all(output_dir)
         .with_context(|| format!("cannot create output directory '{}'", output_dir.display()))?;
 
-    let output_path = output_dir.join(&options.output_name);
+    let output_path = output_dir.join(name);
+    if let Ok(output) = output_path.canonicalize() {
+        for input in input_paths {
+            if input.canonicalize().is_ok_and(|path| path == output) {
+                anyhow::bail!("Merge output would overwrite an input file. Choose a different filename or folder.");
+            }
+        }
+    }
     let format = infer_format(input_paths[0].as_path())
         .with_context(|| format!("cannot infer format for '{}'", input_paths[0].display()))?;
 
@@ -708,6 +721,22 @@ fn extract_token_region(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_input_overwrite_and_output_path_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.fa");
+        let second = dir.path().join("second.fa");
+        let original = b">first\nACGT\n";
+        std::fs::write(&first, original).unwrap();
+        std::fs::write(&second, b">second\nTGCA\n").unwrap();
+        for name in ["first.fa", "../escaped.fa", "sub/escaped.fa", "sub\\escaped.fa", "C:escaped.fa"] {
+            let options = MergeOptions { output_name: name.into(), compress: Some(false),
+                tool_paths: ToolPaths::default(), reference_path: None, cancel: None };
+            assert!(merge_files(&[first.clone(), second.clone()], dir.path(), &options, None).is_err());
+            assert_eq!(std::fs::read(&first).unwrap(), original);
+        }
+    }
 
     #[test]
     fn suggests_common_suffix_for_similar_names() {

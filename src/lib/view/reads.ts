@@ -25,6 +25,7 @@ export function packReadsSquish(
   let visible = readsOverlapWindow(reads, viewStart, viewEnd);
   // Hard cap inputs before packing — packing O(n×lanes) gets expensive.
   const PACK_INPUT_CAP = 6_000;
+  const omittedByCap = Math.max(0, visible.length - PACK_INPUT_CAP);
   if (visible.length > PACK_INPUT_CAP) {
     visible = visible.slice(0, PACK_INPUT_CAP);
   }
@@ -45,7 +46,7 @@ export function packReadsSquish(
 
   const laneEnds: number[] = [];
   const packed: PackedRead[] = [];
-  let hiddenCount = 0;
+  let hiddenCount = omittedByCap;
 
   for (const read of visible) {
     let lane = 0;

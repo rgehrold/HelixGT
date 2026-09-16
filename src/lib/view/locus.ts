@@ -49,19 +49,21 @@ export function parseLocus(
   const dash = body.indexOf("-");
   if (dash < 0) {
     const pos = Number(strip(body));
-    if (!Number.isFinite(pos) || pos < 1) {
+    if (!Number.isSafeInteger(pos) || pos < 1) {
       return { ok: false, message: "Invalid position" };
     }
+    if (contigLength > 0 && pos > contigLength) return { ok: false, message: "Position exceeds contig length" };
     return centerOn(contig, pos, contigLength);
   }
 
   const left = strip(body.slice(0, dash));
   const rightRaw = body.slice(dash + 1).trim();
   const start1 = Number(left);
-  if (!Number.isFinite(start1) || start1 < 1) {
+  if (!Number.isSafeInteger(start1) || start1 < 1) {
     return { ok: false, message: "Invalid start" };
   }
 
+  if (contigLength > 0 && start1 > contigLength) return { ok: false, message: "Start exceeds contig length" };
   if (!rightRaw) {
     const end0 = contigLength > 0 ? contigLength : start1;
     return {
@@ -73,7 +75,7 @@ export function parseLocus(
   }
 
   const end1 = Number(strip(rightRaw));
-  if (!Number.isFinite(end1) || end1 < start1) {
+  if (!Number.isSafeInteger(end1) || end1 < start1) {
     return { ok: false, message: "Invalid end" };
   }
 
@@ -81,7 +83,7 @@ export function parseLocus(
     ok: true,
     contig,
     viewStart: start1 - 1,
-    viewEnd: end1,
+    viewEnd: contigLength > 0 ? Math.min(end1, contigLength) : end1,
   };
 }
 

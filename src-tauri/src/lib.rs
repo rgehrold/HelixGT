@@ -279,8 +279,12 @@ fn to_preflight_response(report: PreflightReport) -> PreflightResponse {
 }
 
 #[tauri::command]
-fn run_fastq_qc(path: String) -> Result<FastqQcSummary, String> {
-    fastq_qc(PathBuf::from(path).as_path()).map_err(|error| format!("{error:#}"))
+async fn run_fastq_qc(path: String) -> Result<FastqQcSummary, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        fastq_qc(PathBuf::from(path).as_path()).map_err(|error| format!("{error:#}"))
+    })
+    .await
+    .map_err(|error| format!("FASTQ QC task failed: {error}"))?
 }
 
 #[derive(Debug, serde::Deserialize)]

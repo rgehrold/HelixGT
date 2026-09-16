@@ -1,7 +1,6 @@
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
 use std::thread;
 
 use anyhow::{Context, Result};
@@ -134,10 +133,16 @@ pub fn run_command_logged(
         .spawn()
         .with_context(|| format!("failed to run {tool}"))?;
 
-    stream_process_output(child.stdout.take(), tool, "stdout", log);
-    stream_process_output(child.stderr.take(), tool, "stderr", log);
-
-    let status = child.wait().with_context(|| format!("failed while waiting for {tool}"))?;
+    // Drain both pipes concurrently. Reading one to EOF before the other can
+    // deadlock when the child fills the unread pipe. Scoped workers also keep
+    // the borrowed log sink alive until all output has been delivered.
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let status = thread::scope(|scope| {
+        scope.spawn(|| stream_process_output(stdout, tool, "stdout", log));
+        scope.spawn(|| stream_process_output(stderr, tool, "stderr", log));
+        child.wait()
+    }).with_context(|| format!("failed while waiting for {tool}"))?;
     if !status.success() {
         anyhow::bail!("{tool} failed with exit code {:?}", status.code());
     }
@@ -150,22 +155,15 @@ fn stream_process_output(
     stream_name: &str,
     log: Option<&dyn ToolLogSink>,
 ) {
-    let Some(stream) = stream else { return };
-    let Some(log) = log else { return };
-
-    let tool_name = tool.to_string();
-    let stream_label = stream_name.to_string();
-    let (tx, rx) = mpsc::channel::<String>();
-
-    thread::spawn(move || {
-        let reader = BufReader::new(stream);
-        for line in reader.lines().map_while(Result::ok) {
-            let _ = tx.send(line);
+    let Some(mut stream) = stream else { return };
+    if let Some(log) = log {
+        for line in BufReader::new(stream).lines().map_while(Result::ok) {
+            log.log_line(tool, stream_name, &line);
         }
-    });
-
-    for line in rx {
-        log.log_line(&tool_name, &stream_label, &line);
+    } else {
+        // Even without a log consumer, keep pipes open and drain them. Closing
+        // the read ends can make an otherwise successful tool fail to write.
+        let _ = std::io::copy(&mut stream, &mut std::io::sink());
     }
 }
 
@@ -370,4 +368,35 @@ pub fn samtools_faidx(samtools: &Path, reference_path: &Path) -> Result<()> {
     let mut command = new_command(samtools);
     command.args(["faidx", reference]);
     run_command(command, "samtools faidx")
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn emit_process_output() {
+        if std::env::var_os("HELIXGT_PIPE_TEST_CHILD").is_none() { return; }
+        // Exceed typical pipe capacity before writing stdout: sequential
+        // stdout/stderr draining cannot complete this child.
+        for _ in 0..2048 { writeln!(std::io::stderr(), "{}", "e".repeat(256)).unwrap(); }
+        writeln!(std::io::stdout(), "stdout-complete").unwrap();
+    }
+
+    #[test]
+    fn drains_both_pipes_with_and_without_logging() {
+        struct Log(AtomicUsize);
+        impl ToolLogSink for Log {
+            fn log_line(&self, _: &str, _: &str, _: &str) { self.0.fetch_add(1, Ordering::Relaxed); }
+        }
+        let log = Log(AtomicUsize::new(0));
+        for sink in [Some(&log as &dyn ToolLogSink), None] {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "external::tests::emit_process_output", "--nocapture"])
+                .env("HELIXGT_PIPE_TEST_CHILD", "1");
+            run_command_logged(command, "pipe test", sink).unwrap();
+        }
+        assert!(log.0.load(Ordering::Relaxed) >= 2049);
+    }
 }

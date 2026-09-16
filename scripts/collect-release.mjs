@@ -6,10 +6,16 @@
  */
 import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, join, relative } from "node:path";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const root = join(fileURLToPath(new URL(".", import.meta.url)), "..");
-const releaseDir = join(root, "src-tauri", "target", "release");
+// Cargo workspace builds go to the workspace target directory; metadata also
+// honors CARGO_TARGET_DIR and .cargo/config.toml overrides.
+const metadata = JSON.parse(execFileSync("cargo", ["metadata", "--format-version", "1", "--no-deps"], {
+  cwd: root, encoding: "utf8", windowsHide: true,
+}));
+const releaseDir = join(metadata.target_directory, "release");
 const bundleDir = join(releaseDir, "bundle");
 const distDir = join(root, "dist");
 
