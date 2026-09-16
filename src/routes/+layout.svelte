@@ -23,12 +23,20 @@
     overflow: hidden;
     background: var(--bg-base);
     color: var(--text-primary);
-    font-family: "DM Sans", system-ui, sans-serif;
+    font-family: "DM Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
     -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
 
   :global(button, input, select) {
     font: inherit;
+  }
+
+  :global(button:focus-visible),
+  :global(input:focus-visible),
+  :global(select:focus-visible) {
+    outline: 2px solid var(--focus-ring, var(--accent-highlight));
+    outline-offset: 1px;
   }
 
   :global(::selection) {
@@ -37,12 +45,12 @@
 
   :global(*) {
     scrollbar-width: thin;
-    scrollbar-color: rgba(71, 85, 105, 0.9) var(--scrollbar-track);
+    scrollbar-color: var(--scrollbar-thumb) var(--scrollbar-track);
   }
 
   :global(*::-webkit-scrollbar) {
-    width: 10px;
-    height: 10px;
+    width: 8px;
+    height: 8px;
   }
 
   :global(*::-webkit-scrollbar-track) {
@@ -52,7 +60,6 @@
 
   :global(*::-webkit-scrollbar-thumb) {
     background: var(--scrollbar-thumb);
-    border: 2px solid var(--scrollbar-track);
     border-radius: 999px;
   }
 

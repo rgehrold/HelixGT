@@ -1,8 +1,10 @@
 import {
   ANN_BAND_PAD,
+  COLLAPSED_TRACK_H,
   COV_BAND_H,
   FEATURE_LANE_H,
   MAX_FEATURE_LANES,
+  DENSITY_STRIP_H,
   OVERVIEW_H,
   PAD_L,
   PAD_R,
@@ -19,6 +21,8 @@ export type TrackBand = {
   top: number;
   height: number;
   toggleable: boolean;
+  /** When true, only a thin header is shown (collapsed via gutter arrow). */
+  collapsed?: boolean;
 };
 
 export type AnnTrackLayout = TrackBand & {
@@ -26,11 +30,21 @@ export type AnnTrackLayout = TrackBand & {
   laneCount: number;
 };
 
+export type CovTrackLayout = TrackBand & {
+  path: string;
+};
+
 export type ReadsTrackLayout = {
+  id: string;
+  path: string;
+  label: string;
+  top: number;
   headerH: number;
   laneH: number;
   laneCount: number;
   height: number;
+  collapsed: boolean;
+  densityOnly: boolean;
 };
 
 export type UnifiedLayout = {
@@ -40,19 +54,30 @@ export type UnifiedLayout = {
   overview: TrackBand;
   ruler: TrackBand;
   seq: TrackBand | null;
-  cov: TrackBand | null;
+  /** @deprecated first coverage track — prefer covTracks */
+  cov: CovTrackLayout | null;
+  covTracks: CovTrackLayout[];
   annTracks: AnnTrackLayout[];
+  /** @deprecated first reads track — prefer readsTracks */
   reads: ReadsTrackLayout | null;
+  readsTracks: ReadsTrackLayout[];
   fixedHeight: number;
+  readsHeight: number;
   bands: TrackBand[];
 };
 
 export type VisibleTracks = {
-  showSeq: boolean;
-  showCov: boolean;
-  annTracks: { path: string; label: string; visible: boolean; laneCount: number }[];
-  showReads: boolean;
-  readLaneCount: number;
+  seqAvailable: boolean;
+  seqExpanded: boolean;
+  covTracks: { path: string; label: string; expanded: boolean }[];
+  annTracks: { path: string; label: string; expanded: boolean; laneCount: number }[];
+  readsTracks: {
+    path: string;
+    label: string;
+    expanded: boolean;
+    laneCount: number;
+    densityOnly: boolean;
+  }[];
 };
 
 export function estimateFeatureLanes(
@@ -100,52 +125,102 @@ export function computeUnifiedLayout(cssW: number, tracks: VisibleTracks): Unifi
   bands.push(ruler);
   y += RULER_H + 1;
 
-  let seq: TrackBand | null = null;
-  if (tracks.showSeq) {
-    seq = { id: "seq", label: "Ref", top: y, height: SEQ_BAND_H, toggleable: true };
-    bands.push(seq);
-    y += SEQ_BAND_H + 1;
+  // Track order (IGV-like): overview → scale → coverage(s) → reference → features → reads.
+  const covTracks: CovTrackLayout[] = [];
+  for (const covIn of tracks.covTracks) {
+    const collapsed = !covIn.expanded;
+    const height = collapsed ? COLLAPSED_TRACK_H : COV_BAND_H;
+    const multi = tracks.covTracks.length > 1;
+    const band: CovTrackLayout = {
+      id: `cov:${covIn.path}`,
+      path: covIn.path,
+      label: multi ? `Coverage · ${covIn.label}` : "Coverage",
+      top: y,
+      height,
+      toggleable: true,
+      collapsed,
+    };
+    covTracks.push(band);
+    bands.push(band);
+    y += height + 1;
   }
+  const cov = covTracks[0] ?? null;
 
-  let cov: TrackBand | null = null;
-  if (tracks.showCov) {
-    cov = { id: "cov", label: "Coverage", top: y, height: COV_BAND_H, toggleable: true };
-    bands.push(cov);
-    y += COV_BAND_H + 1;
+  let seq: TrackBand | null = null;
+  if (tracks.seqAvailable) {
+    const collapsed = !tracks.seqExpanded;
+    const height = collapsed ? COLLAPSED_TRACK_H : SEQ_BAND_H;
+    seq = {
+      id: "seq",
+      label: "Reference",
+      top: y,
+      height,
+      toggleable: true,
+      collapsed,
+    };
+    bands.push(seq);
+    y += height + 1;
   }
 
   const annTracks: AnnTrackLayout[] = [];
   for (const ann of tracks.annTracks) {
-    if (!ann.visible) continue;
+    const collapsed = !ann.expanded;
     const lanes = Math.min(MAX_FEATURE_LANES, Math.max(1, ann.laneCount));
-    const h = ANN_BAND_PAD + lanes * FEATURE_LANE_H;
+    const height = collapsed
+      ? COLLAPSED_TRACK_H
+      : ANN_BAND_PAD + lanes * FEATURE_LANE_H;
     const band: AnnTrackLayout = {
       id: `ann:${ann.path}`,
       path: ann.path,
       label: ann.label,
       top: y,
-      height: h,
+      height,
       toggleable: true,
-      laneCount: lanes,
+      collapsed,
+      laneCount: collapsed ? 0 : lanes,
     };
     annTracks.push(band);
     bands.push(band);
-    y += h + 1;
+    y += height + 1;
   }
 
-  let reads: ReadsTrackLayout | null = null;
-  if (tracks.showReads) {
-    const laneCount = Math.max(1, tracks.readLaneCount);
-    const height = READS_HEADER_H + laneCount * READ_LANE_H + 4;
-    reads = { headerH: READS_HEADER_H, laneH: READ_LANE_H, laneCount, height };
+  const readsTracks: ReadsTrackLayout[] = [];
+  let readsY = 0;
+  for (const rd of tracks.readsTracks) {
+    const collapsed = !rd.expanded;
+    const densityOnly = !collapsed && rd.densityOnly;
+    const laneCount = collapsed || densityOnly ? 0 : Math.max(1, rd.laneCount);
+    const height = collapsed
+      ? COLLAPSED_TRACK_H
+      : densityOnly
+        ? READS_HEADER_H + DENSITY_STRIP_H
+        : READS_HEADER_H + laneCount * READ_LANE_H + 4;
+    const multi = tracks.readsTracks.length > 1;
+    const layout: ReadsTrackLayout = {
+      id: `reads:${rd.path}`,
+      path: rd.path,
+      label: multi ? `Alignments · ${rd.label}` : "Alignments",
+      top: readsY,
+      headerH: collapsed ? COLLAPSED_TRACK_H : READS_HEADER_H,
+      laneH: READ_LANE_H,
+      laneCount,
+      height,
+      collapsed,
+      densityOnly,
+    };
+    readsTracks.push(layout);
     bands.push({
-      id: "reads",
-      label: "Alignments",
-      top: y,
+      id: layout.id,
+      label: layout.label,
+      top: y + readsY,
       height,
       toggleable: true,
+      collapsed,
     });
+    readsY += height + (tracks.readsTracks.length > 1 ? 1 : 0);
   }
+  const reads = readsTracks[0] ?? null;
+  const readsHeight = Math.max(0, readsY);
 
   return {
     padL,
@@ -155,9 +230,12 @@ export function computeUnifiedLayout(cssW: number, tracks: VisibleTracks): Unifi
     ruler,
     seq,
     cov,
+    covTracks,
     annTracks,
     reads,
+    readsTracks,
     fixedHeight: y,
+    readsHeight,
     bands,
   };
 }
@@ -174,13 +252,17 @@ export function computeTrackLayout(
   featureLaneCount: number,
 ) {
   return computeUnifiedLayout(cssW, {
-    showSeq: tracks.showSeq,
-    showCov: tracks.showCov,
-    annTracks: tracks.showFeat
-      ? [{ path: "_", label: "Features", visible: true, laneCount: featureLaneCount }]
+    seqAvailable: tracks.showSeq,
+    seqExpanded: tracks.showSeq,
+    covTracks: tracks.showCov
+      ? [{ path: "_", label: "Coverage", expanded: true }]
       : [],
-    showReads: tracks.showReads,
-    readLaneCount: 1,
+    annTracks: tracks.showFeat
+      ? [{ path: "_", label: "Features", expanded: true, laneCount: featureLaneCount }]
+      : [],
+    readsTracks: tracks.showReads
+      ? [{ path: "_", label: "Alignments", expanded: true, laneCount: 1, densityOnly: false }]
+      : [],
   });
 }
 

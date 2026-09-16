@@ -202,8 +202,19 @@
       await alignPane?.loadReferenceFromPath(path);
       return;
     }
-    // Convert, View, and File analysis share the CRAM reference FASTA path.
+    // Convert, View, and File analysis share the reference FASTA path.
+    // ViewPane watches referencePath and loads it onto the Reference track.
     if (activeMode === "convert" || activeMode === "view" || activeMode === "analyze") {
+      // Force a change even if the same path is re-selected (e.g. after clearing).
+      if (referencePath === path) {
+        referencePath = "";
+        // Let the clear apply before re-setting so View's $effect re-runs.
+        queueMicrotask(() => {
+          referencePath = path;
+          pushLog(`Reference set to ${path}`);
+        });
+        return;
+      }
       referencePath = path;
       pushLog(`Reference set to ${path}`);
     }
@@ -302,10 +313,7 @@
       const rect = workspace.getBoundingClientRect();
       if (shouldSnapCollapseFilesPane(moveEvent.clientX, rect.left)) {
         snapCollapse = true;
-        filesPaneWidth = clampFilesPaneWidth(
-          (80 / rect.width) * 100,
-          rect.width,
-        );
+        filesPaneWidth = clampFilesPaneWidth((80 / rect.width) * 100, rect.width);
         return;
       }
       snapCollapse = false;
@@ -547,13 +555,15 @@
 <style>
   .app {
     height: 100vh;
+    height: 100dvh;
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    padding: 6px 10px 8px;
+    padding: 8px 12px 10px;
+    gap: 4px;
     background:
-      radial-gradient(circle at top left, var(--bg-glow-1), transparent 28%),
-      radial-gradient(circle at 85% 10%, var(--bg-glow-2), transparent 24%),
+      radial-gradient(ellipse 60% 40% at 8% 0%, var(--bg-glow-1), transparent 55%),
+      radial-gradient(ellipse 45% 35% at 92% 8%, var(--bg-glow-2), transparent 50%),
       var(--bg-base);
   }
 
@@ -580,7 +590,7 @@
     min-height: 0;
     flex-shrink: 0;
     overflow: hidden;
-    padding: 8px 8px 8px !important;
+    padding: 10px !important;
   }
 
   .files-panel.dragging {
@@ -595,9 +605,9 @@
   }
 
   .files-stash {
-    flex: 0 0 28px;
-    width: 28px;
-    margin-right: 4px;
+    flex: 0 0 30px;
+    width: 30px;
+    margin-right: 6px;
     border-radius: 10px;
     border: 1px solid var(--panel-border);
     background: var(--panel-bg);
@@ -611,9 +621,11 @@
     text-orientation: mixed;
     font: inherit;
     font-size: 0.72rem;
-    font-weight: 650;
-    letter-spacing: 0.06em;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
     box-shadow: var(--panel-shadow);
+    transition: color 0.12s ease, background 0.12s ease, border-color 0.12s ease;
   }
 
   .files-stash:hover {
@@ -628,22 +640,44 @@
   }
 
   .resize-handle {
-    flex: 0 0 6px;
-    width: 6px;
-    min-width: 6px;
+    /* Wider hit target; visible bar via ::before */
+    flex: 0 0 12px;
+    width: 12px;
+    min-width: 12px;
     margin: 0 4px;
     border-radius: 999px;
     cursor: col-resize;
+    background: transparent;
+    border: none;
+    align-self: stretch;
+    position: relative;
+    transition: background 0.15s ease;
+  }
+
+  .resize-handle::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 50%;
+    width: 4px;
+    transform: translateX(-50%);
+    border-radius: 999px;
     background: var(--resize-bg);
     border: 1px solid var(--resize-border);
-    align-self: stretch;
-    transition: background 0.15s ease, border-color 0.15s ease;
+    transition: background 0.15s ease, border-color 0.15s ease, width 0.15s ease;
+  }
+
+  .resize-handle:hover::before,
+  .workspace.resizing .resize-handle::before {
+    width: 6px;
+    background: var(--resize-hover-bg);
+    border-color: var(--resize-hover-border);
   }
 
   .resize-handle:hover,
   .workspace.resizing .resize-handle {
-    background: var(--resize-hover-bg);
-    border-color: var(--resize-hover-border);
+    background: color-mix(in srgb, var(--resize-hover-bg) 35%, transparent);
   }
 
   .right-column {
@@ -658,6 +692,7 @@
 
   .right-column > .settings-panel {
     flex: 1 1 auto;
+    min-height: 0;
   }
 
   .panel {
@@ -665,7 +700,6 @@
     border: 1px solid var(--panel-border);
     border-radius: 12px;
     padding: 10px 12px;
-    backdrop-filter: blur(10px);
     box-shadow: var(--panel-shadow);
     min-height: 0;
   }
@@ -681,14 +715,14 @@
   }
 
   .mode-rail {
-    flex: 0 0 84px;
-    width: 84px;
+    flex: 0 0 88px;
+    width: 88px;
     display: flex;
     flex-direction: column;
-    gap: 2px;
-    padding: 8px 6px;
+    gap: 3px;
+    padding: 10px 7px;
     border-right: 1px solid var(--panel-border);
-    background: color-mix(in srgb, var(--tree-bg) 80%, transparent);
+    background: var(--rail-bg, var(--tree-bg));
   }
 
   .mode-tab {
@@ -702,9 +736,10 @@
     border: 1px solid transparent;
     background: transparent;
     color: var(--text-menu);
-    padding: 7px 8px;
+    padding: 8px 9px;
     border-radius: 8px;
     font: inherit;
+    transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
   }
 
   .mode-tab:hover {
@@ -716,22 +751,24 @@
     color: var(--chip-active-text);
     border-color: var(--chip-active-border);
     background: var(--chip-active-bg);
-    box-shadow: inset 3px 0 0 var(--accent-highlight);
+    box-shadow: inset 2px 0 0 var(--accent-highlight);
   }
 
   .mode-tab-title {
     font-size: 0.78rem;
-    font-weight: 650;
+    font-weight: 600;
     line-height: 1.15;
+    letter-spacing: 0.01em;
   }
 
   .settings-body {
     flex: 1 1 auto;
     min-width: 0;
+    min-height: 0;
     display: flex;
     flex-direction: column;
     overflow: hidden;
-    padding: 8px 10px 10px;
+    padding: 10px 12px 12px;
   }
 
   .settings-scroll {
@@ -746,6 +783,13 @@
     display: flex;
     flex-direction: column;
     overflow: hidden;
+    min-height: 0;
+  }
+
+  .settings-scroll.view-scroll :global(.pane-body) {
+    flex: 1 1 auto;
+    min-height: 0;
+    height: 100%;
   }
 
   h2 {

@@ -1,24 +1,31 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
+#[cfg(test)]
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::{bail, Context, Result};
+use noodles::core::{Position, Region};
 use serde::Serialize;
 
 use crate::convert::open_buf_reader;
 use crate::format::{infer_format, is_gzipped, FileFormat};
 
+use super::contig::{contig_name_aliases, find_named};
+
 /// Maximum bases returned in one window (keeps IPC payloads bounded).
 pub const MAX_SEQUENCE_WINDOW: u64 = 2_000_000;
 
-/// Refuse to scan unindexed files larger than this when opening (bytes on disk).
+/// Refuse to fully scan unindexed files larger than this when opening (bytes on disk).
 const MAX_OPEN_FILE_BYTES: u64 = 512 * 1024 * 1024;
 
 /// If total bases across contigs are at or below this, keep the whole file in memory after open.
-const FULL_CACHE_TOTAL_BASES: u64 = 256 * 1024 * 1024;
+/// Raised for desktop machines with ample RAM (smooth multi-contig / large-ref sessions).
+const FULL_CACHE_TOTAL_BASES: u64 = 512 * 1024 * 1024;
 
 /// If a single contig/read is at or below this, cache its full sequence on first access.
-const FULL_CACHE_CONTIG_BASES: u64 = 64 * 1024 * 1024;
+const FULL_CACHE_CONTIG_BASES: u64 = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -58,6 +65,8 @@ struct CachedDocument {
     /// Contig name → full sequence (only those loaded so far).
     sequences: HashMap<String, String>,
     fully_cached: bool,
+    /// When set, random-access windows use this FASTA index (`.fai`).
+    fai_path: Option<PathBuf>,
 }
 
 fn document_cache() -> &'static Mutex<HashMap<String, CachedDocument>> {
@@ -71,6 +80,167 @@ fn cache_key(path: &Path) -> String {
         .unwrap_or_else(|_| path.to_path_buf())
         .to_string_lossy()
         .to_string()
+}
+
+/// Sidecar path used by samtools / noodles: `ref.fa` → `ref.fa.fai`.
+fn fai_sidecar_path(fasta: &Path) -> PathBuf {
+    let mut s = OsString::from(fasta.as_os_str());
+    s.push(".fai");
+    PathBuf::from(s)
+}
+
+fn find_contig<'a>(contigs: &'a [ContigInfo], requested: &str) -> Option<&'a ContigInfo> {
+    find_named(contigs, requested, |c| c.name.as_str())
+}
+
+fn fai_index_cache() -> &'static Mutex<HashMap<String, std::sync::Arc<noodles::fasta::fai::Index>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, std::sync::Arc<noodles::fasta::fai::Index>>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn load_fai_cached(fai_path: &Path) -> Result<std::sync::Arc<noodles::fasta::fai::Index>> {
+    let key = cache_key(fai_path);
+    if let Ok(cache) = fai_index_cache().lock() {
+        if let Some(idx) = cache.get(&key) {
+            return Ok(idx.clone());
+        }
+    }
+    let index = noodles::fasta::fai::read(fai_path)
+        .with_context(|| format!("failed to read FASTA index '{}'", fai_path.display()))?;
+    let arc = std::sync::Arc::new(index);
+    if let Ok(mut cache) = fai_index_cache().lock() {
+        if cache.len() >= 16 && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        cache.insert(key, arc.clone());
+    }
+    Ok(arc)
+}
+
+fn contigs_from_fai(index: &noodles::fasta::fai::Index) -> Vec<ContigInfo> {
+    index
+        .as_ref()
+        .iter()
+        .map(|record| ContigInfo {
+            name: String::from_utf8_lossy(record.name()).into_owned(),
+            length: record.length(),
+        })
+        .collect()
+}
+
+fn read_fai_contigs(fai_path: &Path) -> Result<Vec<ContigInfo>> {
+    let index = load_fai_cached(fai_path)?;
+    let contigs = contigs_from_fai(index.as_ref());
+    if contigs.is_empty() {
+        bail!("FASTA index '{}' contains no sequences", fai_path.display());
+    }
+    Ok(contigs)
+}
+
+/// Build a `.fai` next to an uncompressed FASTA (one sequential pass).
+/// Not used on the hot open path (too slow for human genomes); tests only.
+#[cfg(test)]
+fn build_fai_sidecar(path: &Path) -> Result<PathBuf> {
+    if is_gzipped(path) {
+        bail!(
+            "cannot build a .fai for gzipped FASTA '{}'. \
+             Decompress it, or use bgzip and provide indexes, or open a smaller reference.",
+            path.display()
+        );
+    }
+    let fai_path = fai_sidecar_path(path);
+    let index = noodles::fasta::io::index(path)
+        .with_context(|| format!("failed to index FASTA '{}'", path.display()))?;
+    let file = std::fs::File::create(&fai_path)
+        .with_context(|| format!("failed to create FASTA index '{}'", fai_path.display()))?;
+    let mut writer = noodles::fasta::fai::io::Writer::new(BufWriter::new(file));
+    writer
+        .write_index(&index)
+        .with_context(|| format!("failed to write FASTA index '{}'", fai_path.display()))?;
+    writer
+        .into_inner()
+        .flush()
+        .with_context(|| format!("failed to flush FASTA index '{}'", fai_path.display()))?;
+    Ok(fai_path)
+}
+
+
+
+fn open_via_fai(path: &Path, fai_path: &Path) -> Result<SequenceDocument> {
+    let contigs = read_fai_contigs(fai_path)?;
+    let total_bases = contigs.iter().map(|c| c.length).sum();
+    let key = cache_key(path);
+
+    if let Ok(mut cache) = document_cache().lock() {
+        // Keep more open documents warm (desktop RAM is plentiful).
+        if cache.len() >= 32 && !cache.contains_key(&key) {
+            let keys: Vec<String> = cache.keys().cloned().take(16).collect();
+            for k in keys {
+                cache.remove(&k);
+            }
+        }
+        cache.insert(
+            key,
+            CachedDocument {
+                format: FileFormat::Fasta,
+                contigs: contigs.clone(),
+                sequences: HashMap::new(),
+                fully_cached: false,
+                fai_path: Some(fai_path.to_path_buf()),
+            },
+        );
+    }
+
+    Ok(SequenceDocument {
+        path: path.display().to_string(),
+        format: FileFormat::Fasta.as_str().to_string(),
+        gzipped: is_gzipped(path),
+        contigs,
+        total_bases,
+        fully_cached: false,
+    })
+}
+
+/// Query a window via `.fai` (0-based half-open → 1-based inclusive region).
+fn extract_fasta_window_fai(
+    path: &Path,
+    fai_path: &Path,
+    contig: &str,
+    start: u64,
+    end: u64,
+) -> Result<String> {
+    let index = load_fai_cached(fai_path)?;
+
+    // Resolve contig against the index names (aliases).
+    let index_contigs = contigs_from_fai(index.as_ref());
+    let resolved = find_contig(&index_contigs, contig)
+        .map(|c| c.name.as_str())
+        .with_context(|| {
+            format!(
+                "contig '{contig}' not found in FASTA index '{}' ({} contigs). \
+                 Check chr vs no-chr naming between the alignment and reference.",
+                fai_path.display(),
+                index_contigs.len()
+            )
+        })?;
+
+    let start_1 = (start.saturating_add(1) as usize).max(1);
+    let end_1 = (end as usize).max(start_1);
+    let start_pos = Position::try_from(start_1).context("invalid region start")?;
+    let end_pos = Position::try_from(end_1).context("invalid region end")?;
+    let region = Region::new(resolved, start_pos..=end_pos);
+
+    let mut reader = noodles::fasta::io::indexed_reader::Builder::default()
+        .set_index((*index).clone())
+        .build_from_path(path)
+        .with_context(|| format!("failed to open indexed FASTA '{}'", path.display()))?;
+
+    let record = reader
+        .query(&region)
+        .with_context(|| format!("failed to query {resolved}:{start_1}-{end_1} in '{}'", path.display()))?;
+
+    Ok(String::from_utf8_lossy(record.sequence().as_ref()).into_owned())
 }
 
 pub fn open_sequence_document(path: &Path) -> Result<SequenceDocument> {
@@ -90,16 +260,6 @@ pub fn open_sequence_document(path: &Path) -> Result<SequenceDocument> {
 
     let meta = std::fs::metadata(path)
         .with_context(|| format!("cannot read metadata for '{}'", path.display()))?;
-    if meta.len() > MAX_OPEN_FILE_BYTES {
-        bail!(
-            "file is too large to open without an index ({:.1} MB). \
-             For huge genomes, use a plain (uncompressed) FASTA with a .fai index. \
-             Max open size is {} MB.",
-            meta.len() as f64 / (1024.0 * 1024.0),
-            MAX_OPEN_FILE_BYTES / (1024 * 1024)
-        );
-    }
-
     let key = cache_key(path);
 
     // Reuse warm cache if already opened.
@@ -117,6 +277,36 @@ pub fn open_sequence_document(path: &Path) -> Result<SequenceDocument> {
         }
     }
 
+    // FASTA: prefer .fai random access for huge genomes (hg38 etc.).
+    if format == FileFormat::Fasta {
+        let fai_path = fai_sidecar_path(path);
+        if fai_path.is_file() {
+            return open_via_fai(path, &fai_path);
+        }
+
+        // Large FASTA without .fai: fail fast. Auto-building a human-genome .fai
+        // can take many minutes and freezes the whole app (blocks the worker pool).
+        if meta.len() > MAX_OPEN_FILE_BYTES {
+            bail!(
+                "reference is too large to open without an index ({:.1} MB). \
+                 Run `samtools faidx` next to the FASTA (creates {}.fai) and try again. \
+                 Max unindexed open size is {} MB.",
+                meta.len() as f64 / (1024.0 * 1024.0),
+                path.file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("reference.fa"),
+                MAX_OPEN_FILE_BYTES / (1024 * 1024)
+            );
+        }
+    } else if meta.len() > MAX_OPEN_FILE_BYTES {
+        bail!(
+            "file is too large to open without an index ({:.1} MB). \
+             Max open size is {} MB.",
+            meta.len() as f64 / (1024.0 * 1024.0),
+            MAX_OPEN_FILE_BYTES / (1024 * 1024)
+        );
+    }
+
     // Load contig index + optionally full sequences in one streaming pass.
     let (contigs, sequences, fully_cached) = match format {
         FileFormat::Fasta => load_fasta_for_view(path)?,
@@ -132,8 +322,12 @@ pub fn open_sequence_document(path: &Path) -> Result<SequenceDocument> {
 
     if let Ok(mut cache) = document_cache().lock() {
         // Bound cache size: drop other entries when opening a new file (simple LRU-less policy).
-        if cache.len() >= 12 && !cache.contains_key(&key) {
-            cache.clear();
+        // Keep more open documents warm (desktop RAM is plentiful).
+        if cache.len() >= 32 && !cache.contains_key(&key) {
+            let keys: Vec<String> = cache.keys().cloned().take(16).collect();
+            for k in keys {
+                cache.remove(&k);
+            }
         }
         cache.insert(
             key,
@@ -142,6 +336,7 @@ pub fn open_sequence_document(path: &Path) -> Result<SequenceDocument> {
                 contigs: contigs.clone(),
                 sequences,
                 fully_cached,
+                fai_path: None,
             },
         );
     }
@@ -181,26 +376,34 @@ pub fn get_sequence_window(
         open_sequence_document(path)?;
     }
 
-    let contig_length = {
+    let (contig_length, resolved_contig, fai_path) = {
         let cache = document_cache()
             .lock()
             .map_err(|_| anyhow::anyhow!("sequence cache lock poisoned"))?;
         let cached = cache
             .get(&key)
             .with_context(|| format!("document not in cache: {}", path.display()))?;
-        cached
-            .contigs
-            .iter()
-            .find(|c| c.name == contig)
-            .map(|c| c.length)
-            .with_context(|| format!("contig '{contig}' not found in '{}'", path.display()))?
+        let info = find_contig(&cached.contigs, contig).with_context(|| {
+            format!(
+                "contig '{contig}' not found in '{}' ({} contigs). \
+                 Check that the reference uses the same chromosome names as the alignment \
+                 (e.g. chr1 vs 1).",
+                path.display(),
+                cached.contigs.len()
+            )
+        })?;
+        (
+            info.length,
+            info.name.clone(),
+            cached.fai_path.clone(),
+        )
     };
 
     let start = start.min(contig_length);
     let end = end.min(contig_length);
     if start >= end {
         return Ok(SequenceSlice {
-            contig: contig.to_string(),
+            contig: resolved_contig,
             start,
             end: start,
             sequence: String::new(),
@@ -216,13 +419,29 @@ pub fn get_sequence_window(
         );
     }
 
-    // Serve from memory when possible.
-    if let Some(mut sequence) = slice_from_cache(&key, contig, start, end)? {
+    // Serve from memory when possible (try requested name and resolved name).
+    if let Some(mut sequence) = slice_from_cache(&key, &resolved_contig, start, end)? {
         if reverse_complement {
             sequence = revcomp(&sequence);
         }
         return Ok(SequenceSlice {
-            contig: contig.to_string(),
+            contig: resolved_contig,
+            start,
+            end,
+            sequence,
+            contig_length,
+            reverse_complemented: reverse_complement,
+        });
+    }
+
+    // FAI-backed random access for large genomes (hg38, etc.).
+    if let Some(fai_path) = fai_path.as_ref() {
+        let mut sequence = extract_fasta_window_fai(path, fai_path, &resolved_contig, start, end)?;
+        if reverse_complement {
+            sequence = revcomp(&sequence);
+        }
+        return Ok(SequenceSlice {
+            contig: resolved_contig,
             start,
             end,
             sequence,
@@ -244,13 +463,13 @@ pub fn get_sequence_window(
     };
 
     if contig_length <= FULL_CACHE_CONTIG_BASES {
-        ensure_contig_cached(path, &key, contig)?;
-        if let Some(mut sequence) = slice_from_cache(&key, contig, start, end)? {
+        ensure_contig_cached(path, &key, &resolved_contig)?;
+        if let Some(mut sequence) = slice_from_cache(&key, &resolved_contig, start, end)? {
             if reverse_complement {
                 sequence = revcomp(&sequence);
             }
             return Ok(SequenceSlice {
-                contig: contig.to_string(),
+                contig: resolved_contig,
                 start,
                 end,
                 sequence,
@@ -260,13 +479,13 @@ pub fn get_sequence_window(
         }
     }
 
-    let mut sequence = get_window_uncached(path, format, contig, start, end)?;
+    let mut sequence = get_window_uncached(path, format, &resolved_contig, start, end)?;
     if reverse_complement {
         sequence = revcomp(&sequence);
     }
 
     Ok(SequenceSlice {
-        contig: contig.to_string(),
+        contig: resolved_contig,
         start,
         end,
         sequence,
@@ -315,14 +534,15 @@ fn ensure_contig_cached(path: &Path, key: &str, contig: &str) -> Result<()> {
             if cached.sequences.contains_key(contig) {
                 return Ok(());
             }
-            let length = cached
-                .contigs
-                .iter()
-                .find(|c| c.name == contig)
+            let length = find_contig(&cached.contigs, contig)
                 .map(|c| c.length)
                 .unwrap_or(0);
             if length > FULL_CACHE_CONTIG_BASES {
                 // Too large for full-contig cache; fall through to one-shot extract without storing.
+                return Ok(());
+            }
+            // FAI-backed large refs should not full-scan; skip memory cache for those.
+            if cached.fai_path.is_some() && length > FULL_CACHE_CONTIG_BASES {
                 return Ok(());
             }
         }
@@ -330,14 +550,42 @@ fn ensure_contig_cached(path: &Path, key: &str, contig: &str) -> Result<()> {
 
     let format = infer_format(path)?;
     let sequence = match format {
-        FileFormat::Fasta => extract_full_fasta_contig(path, contig)?,
+        FileFormat::Fasta => {
+            // Prefer fai extract of full contig when available.
+            let fai_path = document_cache()
+                .lock()
+                .ok()
+                .and_then(|c| c.get(key).and_then(|d| d.fai_path.clone()));
+            if let Some(fai_path) = fai_path {
+                let len = {
+                    let cache = document_cache()
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("sequence cache lock poisoned"))?;
+                    find_contig(
+                        &cache
+                            .get(key)
+                            .map(|c| c.contigs.clone())
+                            .unwrap_or_default(),
+                        contig,
+                    )
+                    .map(|c| c.length)
+                    .unwrap_or(0)
+                };
+                if len > 0 && len <= FULL_CACHE_CONTIG_BASES {
+                    extract_fasta_window_fai(path, &fai_path, contig, 0, len)?
+                } else {
+                    return Ok(());
+                }
+            } else {
+                extract_full_fasta_contig(path, contig)?
+            }
+        }
         FileFormat::Fastq => extract_full_fastq_contig(path, contig)?,
         _ => bail!("unsupported format"),
     };
 
     if sequence.len() as u64 > FULL_CACHE_CONTIG_BASES {
         // Don't store huge contigs; store nothing and extract window on demand below.
-        // For oversized contigs we extract the window directly once.
         return Ok(());
     }
 
@@ -424,10 +672,11 @@ fn extract_full_fasta_contig(path: &Path, contig: &str) -> Result<String> {
         .build_from_reader(open_buf_reader(path)?)
         .with_context(|| format!("failed to open FASTA '{}'", path.display()))?;
 
+    let aliases = contig_name_aliases(contig);
     for (index, result) in reader.records().enumerate() {
         let record = result.with_context(|| format!("invalid FASTA record #{}", index + 1))?;
         let name = String::from_utf8_lossy(record.name());
-        if name == contig {
+        if aliases.iter().any(|a| a == name.as_ref()) || name.eq_ignore_ascii_case(contig) {
             return Ok(String::from_utf8_lossy(record.sequence().as_ref()).into_owned());
         }
     }
@@ -448,6 +697,11 @@ fn extract_full_fastq_contig(path: &Path, contig: &str) -> Result<String> {
 
 /// Fallback extract when contig is too large to cache fully.
 fn extract_fasta_window(path: &Path, contig: &str, start: u64, end: u64) -> Result<String> {
+    // Prefer fai when available (even if open path didn't store it — e.g. race).
+    let fai = fai_sidecar_path(path);
+    if fai.is_file() {
+        return extract_fasta_window_fai(path, &fai, contig, start, end);
+    }
     let full = extract_full_fasta_contig(path, contig)?;
     let s = start as usize;
     let e = (end as usize).min(full.len());
@@ -589,5 +843,49 @@ mod tests {
         let path = dir.path().join("x.bed");
         std::fs::write(&path, b"chr1\t0\t10\n").unwrap();
         assert!(open_sequence_document(&path).is_err());
+    }
+
+    #[test]
+    fn opens_via_fai_and_queries_window() {
+        clear_sequence_cache(None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ref.fa");
+        // Fixed-width lines so fai math is correct.
+        std::fs::write(&path, b">chr1\nACGTACGTAC\nGTACGTACGT\n>chr2\nTTTT\n").unwrap();
+        let fai = build_fai_sidecar(&path).unwrap();
+        assert!(fai.is_file());
+
+        // Clear any stream-cache from index build path, open fresh via fai only.
+        clear_sequence_cache(None);
+        let doc = open_sequence_document(&path).unwrap();
+        assert_eq!(doc.contigs.len(), 2);
+        assert_eq!(doc.contigs[0].length, 20);
+        assert!(!doc.fully_cached);
+
+        let slice = get_sequence_window(&path, "chr1", 0, 4, false).unwrap();
+        assert_eq!(slice.sequence, "ACGT");
+        let slice2 = get_sequence_window(&path, "chr1", 8, 12, false).unwrap();
+        assert_eq!(slice2.sequence, "ACGT");
+        // Alias: request without chr prefix.
+        let slice3 = get_sequence_window(&path, "1", 0, 4, false).unwrap();
+        assert_eq!(slice3.sequence, "ACGT");
+        assert_eq!(slice3.contig, "chr1");
+    }
+
+    #[test]
+    fn contig_aliases_chr_and_bare() {
+        let contigs = vec![
+            ContigInfo {
+                name: "chr1".into(),
+                length: 100,
+            },
+            ContigInfo {
+                name: "chrM".into(),
+                length: 50,
+            },
+        ];
+        assert_eq!(find_contig(&contigs, "1").unwrap().name, "chr1");
+        assert_eq!(find_contig(&contigs, "chr1").unwrap().name, "chr1");
+        assert_eq!(find_contig(&contigs, "MT").unwrap().name, "chrM");
     }
 }

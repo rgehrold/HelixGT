@@ -637,10 +637,11 @@ export const MANUAL_PAGES: ManualPage[] = [
       {
         type: "ul",
         items: [
-          "Reference sequence (FASTA/FASTQ) with base coloring when zoomed in.",
+          "Coverage histogram (indexed BAM/CRAM).",
+          "Reference sequence track (FASTA/FASTQ); bases colored when zoomed in.",
+          "Read pileup: SNV mismatches vs reference, purple insertion carets, black deletion spans (when zoomed in).",
           "Feature track for GFF/BED intervals.",
-          "Coverage histogram from samtools depth (indexed BAM/CRAM).",
-          "Pileup bars for individual alignments (CIGAR, soft-clips, indels, mismatches vs reference); click a bar for the read inspector.",
+          "Click a pileup bar for the single-read inspector.",
         ],
       },
       {
@@ -651,8 +652,10 @@ export const MANUAL_PAGES: ManualPage[] = [
         type: "ul",
         items: [
           "Coordinate-sorted alignments.",
-          "Index present: .bai for BAM, .crai for CRAM.",
-          "CRAM also needs a reference FASTA (Convert reference field or Set as reference).",
+          "Index present: .bam.bai / .bai / .csi for BAM, .cram.crai / .crai for CRAM.",
+          "CRAM also needs a reference FASTA (reference field or right-click → Set as reference). That FASTA is loaded onto the Reference track. Indexed CRAM is queried natively when possible; otherwise samtools is used.",
+          "Large references (e.g. hg38): use an uncompressed FASTA with a .fai index (samtools faidx). Files larger than 512 MB without a .fai are refused (building a human-genome index would freeze the app).",
+          "Chromosome names should match the alignment (chr1 vs 1). HelixGT aliases common forms (chr1 ↔ 1, chrM ↔ MT) for FASTA, BAM/CRAM, GFF/BED, and the locus box.",
         ],
       },
       {
@@ -682,8 +685,17 @@ export const MANUAL_PAGES: ManualPage[] = [
         ],
       },
       {
+        type: "ul",
+        items: [
+          "Scroll on coverage (or reference / features) — pan left and right.",
+          "Ctrl + scroll (⌘ on macOS) — zoom in or out centered on the mouse pointer.",
+          "Scroll on the alignments track — move up and down through the pileup list.",
+          "Shift + scroll on alignments — pan left and right without leaving that track.",
+        ],
+      },
+      {
         type: "p",
-        text: "See Keyboard & mouse shortcuts for gesture details (scroll, Ctrl+scroll, shift-drag, etc.).",
+        text: "See Keyboard & mouse shortcuts for the full gesture list.",
       },
     ],
   },
@@ -699,7 +711,7 @@ export const MANUAL_PAGES: ManualPage[] = [
       },
       {
         type: "note",
-        text: "Names must match across layers (e.g. chr1 vs 1). If features or reads do not appear, confirm contig naming matches the reference.",
+        text: "Common aliases are remapped automatically (chr1 ↔ 1, chrM ↔ MT). You can type either form in the locus box. Unusual naming (scaffold vs chr) still needs an exact match.",
       },
     ],
   },
@@ -727,7 +739,7 @@ export const MANUAL_PAGES: ManualPage[] = [
     blocks: [
       {
         type: "p",
-        text: "Histogram of read depth from samtools depth over the visible window (requires an open indexed BAM/CRAM). Click a bar for bin depth details in the inspector.",
+        text: "Histogram of read depth from the indexed BAM/CRAM (native noodles + BAI for BAM; native CRAM or samtools view for CRAM). Y-scale follows the viewport-local maximum (with a small floor). The overview strip shows a coarse whole-contig sparkline. Click a bar for bin depth details.",
       },
       {
         type: "note",
@@ -743,7 +755,7 @@ export const MANUAL_PAGES: ManualPage[] = [
     blocks: [
       {
         type: "p",
-        text: "Shows GFF/BED intervals overlapping the current window. Open annotation files with Open selected or right-click → Open in View. Click a feature for details; double-click to zoom.",
+        text: "Shows GFF/BED intervals overlapping the current window. Display → Features picks gene/transcript, exon/UTR, CDS, or all types. Click a feature for details; double-click to zoom.",
       },
     ],
   },
@@ -755,11 +767,23 @@ export const MANUAL_PAGES: ManualPage[] = [
     blocks: [
       {
         type: "p",
-        text: "Canvas track of individual alignments drawn when zoomed in enough. Bars encode CIGAR structure (matches, insertions, deletions, soft-clips). Mismatches vs the open reference highlight when base resolution allows.",
+        text: "Canvas track of individual alignments drawn when zoomed in enough (pileup loads at ≤12 kb; base detail when tighter). Bars encode CIGAR structure.",
+      },
+      {
+        type: "ul",
+        items: [
+          "SNV mismatches — alternate base color (and letter when fully zoomed) vs the open reference; opacity follows base quality when available.",
+          "Insertions (I) — purple I-beam / caret at the insertion site (IGV-style).",
+          "Deletions (D) — black bar spanning deleted reference bases; multi-base dels can show length when zoomed in.",
+          "Skips / introns (N) — thin black line through the bar (e.g. spliced RNA).",
+          "Soft-clips (S) — paler bars beyond the aligned span.",
+          "Pair connectors — faint lines from a read to its mate when both are in view.",
+          "Zoomed out (>12 kb) — a coverage density strip instead of individual bars. Open several BAM/CRAM files at once to stack tracks.",
+        ],
       },
       {
         type: "p",
-        text: "Click a bar for full read details (name, flags, MAPQ, CIGAR, sequence, qualities). Color mode is controlled by Color reads.",
+        text: "Toggle Display → “Mismatch & indel highlights”. Color mode for whole bars is controlled by Color reads. Click a bar for full read details (name, flags, MAPQ, CIGAR, sequence).",
       },
     ],
   },
@@ -843,11 +867,12 @@ export const MANUAL_PAGES: ManualPage[] = [
     id: "view-color-by",
     categoryId: "view",
     title: "Color reads by",
-    keywords: ["color", "strand", "mapq", "pair", "proper pair"],
+    keywords: ["color", "strand", "mapq", "pair", "proper pair", "gray", "grey"],
     blocks: [
       {
         type: "ul",
         items: [
+          "Gray (default) — uniform light-grey bars (IGV-style) so mismatch bases stand out.",
           "Strand — forward vs reverse strand alignments.",
           "MAPQ — green / amber / red bands by mapping quality.",
           "Pair status — proper pairs vs other paired or unpaired reads.",
@@ -1869,12 +1894,17 @@ export const MANUAL_PAGES: ManualPage[] = [
       {
         type: "kbd",
         items: [
-          { keys: "Scroll", desc: "Pan along the contig" },
-          { keys: "Ctrl + Scroll", desc: "Zoom in / out" },
-          { keys: "Shift-drag or middle-drag", desc: "Pan the canvas" },
-          { keys: "Drag", desc: "Select a base range" },
+          { keys: "Scroll on coverage / ref / features", desc: "Pan left / right along the contig" },
+          { keys: "Ctrl + Scroll (or ⌘ + Scroll)", desc: "Zoom in / out at the pointer" },
+          { keys: "Scroll on alignments", desc: "Scroll the pileup list vertically" },
+          { keys: "Shift + Scroll on alignments", desc: "Pan left / right" },
+          { keys: "Drag", desc: "Pan the canvas" },
+          { keys: "Shift-drag", desc: "Select a base range" },
+          { keys: "Middle-drag", desc: "Pan the canvas" },
           { keys: "Click", desc: "Inspect feature, read, or coverage bar" },
           { keys: "Double-click", desc: "Zoom to feature or read" },
+          { keys: "+ / −", desc: "Zoom in / out at center" },
+          { keys: "← / →", desc: "Pan by a fraction of the window" },
         ],
       },
       {

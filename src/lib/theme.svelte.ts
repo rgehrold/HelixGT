@@ -1,4 +1,5 @@
 import { browser } from "$app/environment";
+import { invalidateThemeColorCache } from "$lib/view/colors";
 
 export type ThemePalette = "blue" | "orange";
 export type ThemeMode = "dark" | "light";
@@ -42,6 +43,8 @@ export function applyTheme() {
     STORAGE_KEY,
     JSON.stringify({ palette: theme.palette, mode: theme.mode }),
   );
+  invalidateThemeColorCache();
+  window.dispatchEvent(new CustomEvent("helixgt-theme"));
 }
 
 export function setPalette(next: ThemePalette) {

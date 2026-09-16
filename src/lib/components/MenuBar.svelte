@@ -205,8 +205,8 @@
   .menubar {
     display: flex;
     align-items: center;
-    gap: 10px;
-    padding: 0 2px 6px;
+    gap: 12px;
+    padding: 2px 4px 8px;
     flex-shrink: 0;
   }
 
@@ -214,7 +214,7 @@
     margin-left: auto;
     display: flex;
     align-items: center;
-    gap: 8px;
+    gap: 6px;
   }
 
   .logs-btn {
@@ -222,11 +222,13 @@
     border: 1px solid var(--chip-border);
     background: var(--chip-bg);
     color: var(--text-menu);
-    padding: 3px 10px;
+    padding: 4px 12px;
     border-radius: 999px;
     font: inherit;
-    font-size: 0.78rem;
+    font-size: 0.76rem;
     font-weight: 600;
+    letter-spacing: 0.01em;
+    transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
   }
 
   .logs-btn:hover {
@@ -244,17 +246,23 @@
     cursor: pointer;
     border: none;
     background: transparent;
-    padding: 0;
+    padding: 4px 6px;
     border-radius: 8px;
     line-height: 0;
+    transition: background 0.12s ease, transform 0.15s ease;
   }
 
   .logo-btn:hover {
     background: var(--menu-hover-bg);
+    transform: translateY(-0.5px);
+  }
+
+  .logo-btn:active {
+    transform: translateY(0);
   }
 
   .app-logo {
-    height: 24px;
+    height: 26px;
     width: auto;
     display: block;
   }
@@ -262,7 +270,11 @@
   .menus {
     display: flex;
     align-items: center;
-    gap: 2px;
+    gap: 1px;
+    padding: 2px;
+    border-radius: 8px;
+    background: color-mix(in srgb, var(--chip-bg) 70%, transparent);
+    border: 1px solid var(--panel-border);
   }
 
   .menu-group {
@@ -279,9 +291,11 @@
   }
 
   .menu-trigger {
-    padding: 4px 8px;
+    padding: 5px 10px;
     border-radius: 6px;
-    font-size: 0.82rem;
+    font-size: 0.8rem;
+    font-weight: 500;
+    transition: background 0.1s ease, color 0.1s ease;
   }
 
   .menu-trigger:hover,
@@ -292,14 +306,14 @@
 
   .dropdown {
     position: absolute;
-    top: calc(100% + 4px);
+    top: calc(100% + 6px);
     left: 0;
-    min-width: 220px;
+    min-width: 228px;
     padding: 6px;
     border-radius: 10px;
     background: var(--dropdown-bg);
     border: 1px solid var(--dropdown-border);
-    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.35);
+    box-shadow: 0 16px 40px rgba(0, 0, 0, 0.28);
     z-index: 40;
   }
 
@@ -309,9 +323,9 @@
     gap: 8px;
     width: 100%;
     text-align: left;
-    padding: 8px 10px;
-    border-radius: 8px;
-    font-size: 0.86rem;
+    padding: 7px 10px;
+    border-radius: 7px;
+    font-size: 0.84rem;
   }
 
   .dropdown-item .check {

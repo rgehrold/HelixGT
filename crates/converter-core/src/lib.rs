@@ -17,9 +17,9 @@ pub use align::{
 };
 pub use cancel::CancelToken;
 pub use external::{
-    guess_reference_for_cram, index_alignment_output_if_needed, index_path_for, minimap2_available,
-    resolve_cram_reference, resolve_minimap2_path, resolve_samtools_path, samtools_available,
-    ToolLogSink,
+    find_alignment_index, guess_reference_for_cram, index_alignment_output_if_needed, index_path_for,
+    minimap2_available, resolve_cram_reference, resolve_minimap2_path, resolve_samtools_path,
+    samtools_available, ToolLogSink,
 };
 pub use reference_io::{
     ensure_reference_index, is_gzip_bytes, is_gzip_path, load_reference_fasta_bytes,
@@ -45,11 +45,12 @@ pub use preflight::{
 pub use qc::{fastq_qc, FastqQcSummary};
 pub use tools::{default_thread_count, helixgt_temp_dir, ToolPaths};
 pub use view::{
-    clear_annotation_cache, clear_sequence_cache, get_coverage_bins, get_features_in_range,
-    get_reads_in_range, get_reads_in_range_filtered, get_sequence_window, open_alignment_document,
-    open_annotation_document, open_sequence_document, AlignmentContig, AlignmentDocument,
-    AlignmentRead, AnnotationContigSpan, AnnotationDocument, AnnotationFeature, CigarOp, ContigInfo,
-    CoverageBin, CoverageWindow, FeatureWindow, ReadQueryOptions, ReadsWindow, SequenceDocument,
-    SequenceSlice, DEFAULT_COVERAGE_BINS, MAX_FEATURES_PER_WINDOW, MAX_READS_PER_WINDOW,
-    MAX_SEQUENCE_WINDOW,
+    clear_annotation_cache, clear_sequence_cache, get_alignment_window, get_coverage_bins,
+    get_coverage_bins_filtered, get_features_in_range, get_features_in_range_filtered,
+    get_overview_coverage, get_reads_in_range, get_reads_in_range_filtered, get_sequence_window,
+    open_alignment_document, open_annotation_document, open_sequence_document, AlignmentContig,
+    AlignmentDocument, AlignmentRead, AlignmentWindow, AnnotationContigSpan, AnnotationDocument,
+    AnnotationFeature, CigarOp, ContigInfo, CoverageBin, CoverageWindow, FeatureWindow,
+    ReadQueryOptions, ReadsWindow, SequenceDocument, SequenceSlice, DEFAULT_COVERAGE_BINS,
+    MAX_FEATURES_PER_WINDOW, MAX_READS_PER_WINDOW, MAX_SEQUENCE_WINDOW,
 };

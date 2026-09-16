@@ -12,15 +12,40 @@ pub trait ToolLogSink: Send + Sync {
     fn log_line(&self, tool: &str, stream: &str, line: &str);
 }
 
+/// Canonical sidecar to *create* when indexing (`file.bam.bai` / `file.cram.crai`).
 pub fn index_path_for(alignment_path: &Path) -> PathBuf {
     let path = alignment_path.to_string_lossy();
-    if path.ends_with(".bam") {
+    let lower = path.to_ascii_lowercase();
+    if lower.ends_with(".bam") {
         PathBuf::from(format!("{path}.bai"))
-    } else if path.ends_with(".cram") {
+    } else if lower.ends_with(".cram") {
         PathBuf::from(format!("{path}.crai"))
     } else {
         alignment_path.with_extension("bai")
     }
+}
+
+/// Discover an existing alignment index next to `path`.
+///
+/// Accepts the common layouts:
+/// - `file.bam.bai` / `file.bam.csi` / `file.cram.crai`
+/// - `file.bai` / `file.csi` / `file.crai` (stem beside the alignment)
+pub fn find_alignment_index(alignment_path: &Path) -> Option<PathBuf> {
+    let lossy = alignment_path.to_string_lossy();
+    let mut candidates = vec![
+        PathBuf::from(format!("{lossy}.bai")),
+        PathBuf::from(format!("{lossy}.csi")),
+        PathBuf::from(format!("{lossy}.crai")),
+        alignment_path.with_extension("bai"),
+        alignment_path.with_extension("csi"),
+        alignment_path.with_extension("crai"),
+    ];
+    if let (Some(dir), Some(stem)) = (alignment_path.parent(), alignment_path.file_stem()) {
+        candidates.push(dir.join(format!("{}.bai", stem.to_string_lossy())));
+        candidates.push(dir.join(format!("{}.csi", stem.to_string_lossy())));
+        candidates.push(dir.join(format!("{}.crai", stem.to_string_lossy())));
+    }
+    candidates.into_iter().find(|p| p.is_file())
 }
 
 pub fn resolve_tool_path(tool_name: &str, extra_paths: &[PathBuf]) -> Option<PathBuf> {

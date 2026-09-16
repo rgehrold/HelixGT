@@ -186,11 +186,11 @@ export interface AlignmentRead {
   end: number;
   strand: string;
   mapq: number;
-  cigar: string;
-  cigarOps: CigarOp[];
+  cigar?: string;
+  cigarOps?: CigarOp[];
   flags: number;
-  sequence: string;
-  qualities: string;
+  sequence?: string;
+  qualities?: string;
   isPaired: boolean;
   isProperPair: boolean;
   isUnmapped: boolean;
@@ -203,8 +203,13 @@ export interface AlignmentRead {
   isFirstInPair: boolean;
   isSecondInPair: boolean;
   templateLength: number;
-  mateContig: string;
+  mateContig?: string;
   mateStart?: number | null;
+}
+
+export interface AlignmentWindow {
+  coverage: CoverageWindow;
+  reads: ReadsWindow;
 }
 
 export interface ReadsWindow {

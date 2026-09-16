@@ -88,7 +88,7 @@
     return alignmentReads.filter(
       (r) =>
         r.name.toLowerCase().includes(q) ||
-        r.cigar.toLowerCase().includes(q) ||
+        (r.cigar ?? "").toLowerCase().includes(q) ||
         r.strand.includes(q) ||
         String(r.mapq).includes(q) ||
         flagSummary(r).toLowerCase().includes(q),
@@ -394,7 +394,7 @@
         r.end,
         r.strand,
         r.mapq,
-        r.cigar,
+        r.cigar ?? "",
         r.flags,
         flagSummary(r),
         r.isPaired ? r.templateLength : "",
@@ -426,7 +426,7 @@
         r.end,
         r.strand,
         r.mapq,
-        r.cigar,
+        r.cigar ?? "",
         r.flags,
         flagSummary(r),
         r.isPaired ? r.templateLength : "",

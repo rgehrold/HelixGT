@@ -23,6 +23,11 @@ export function packReadsSquish(
 ): PackReadsResult {
   // Binary filter of overlapping reads (engine output is start-sorted).
   let visible = readsOverlapWindow(reads, viewStart, viewEnd);
+  // Hard cap inputs before packing — packing O(n×lanes) gets expensive.
+  const PACK_INPUT_CAP = 6_000;
+  if (visible.length > PACK_INPUT_CAP) {
+    visible = visible.slice(0, PACK_INPUT_CAP);
+  }
   if (visible.length > 1) {
     let needsSort = false;
     for (let i = 1; i < Math.min(visible.length, 32); i++) {
@@ -111,97 +116,38 @@ export function readFilterKey(opts: {
   ].join("|");
 }
 
+/**
+ * Filter start-sorted reads that overlap [start, end) (half-open).
+ *
+ * Important: we must NOT binary-search by `read.end` on a start-sorted list.
+ * A long read that starts before the viewport (and covers it) can be followed by
+ * short reads that end before the viewport — searching by end would skip the
+ * long read and make the pileup empty when zoomed in.
+ */
 export function readsOverlapWindow(
   reads: AlignmentRead[],
   start: number,
   end: number,
 ): AlignmentRead[] {
-  if (reads.length === 0) return [];
-  // Reads from the engine are sorted by start, then name.
-  let lo = 0;
+  if (reads.length === 0 || end <= start) return [];
+
+  // Upper bound: first index with start >= end (everything after is past the window).
   let hi = reads.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (reads[mid]!.end <= start) lo = mid + 1;
-    else hi = mid;
-  }
-  const out: AlignmentRead[] = [];
-  for (let i = lo; i < reads.length; i++) {
-    const r = reads[i]!;
-    if (r.start >= end) break;
-    if (r.end > start) out.push(r);
-  }
-  return out;
-}
-
-function matchesMatch(op: string): boolean {
-  return op === "M" || op === "=" || op === "X";
-}
-
-/**
- * Per-base mismatch fraction in the viewport for optional coverage tinting.
- * Index i = genomic position viewStart + i.
- */
-export function mismatchFractions(
-  reads: AlignmentRead[],
-  viewStart: number,
-  viewEnd: number,
-  ref: { start: number; end: number; sequence: string } | null,
-  maxBp: number,
-): Float32Array | null {
-  if (!ref || reads.length === 0 || viewEnd <= viewStart) return null;
-  const span = viewEnd - viewStart;
-  if (span > maxBp) return null;
-  const n = span;
-  const counts = new Float32Array(n);
-  const depth = new Float32Array(n);
-
-  for (const r of reads) {
-    if (r.end <= viewStart || r.start >= viewEnd || !r.sequence) continue;
-    let refPos = r.start;
-    let seqPos = 0;
-    const ops =
-      r.cigarOps?.length > 0
-        ? r.cigarOps
-        : [{ op: "M", length: Math.max(1, r.end - r.start) }];
-    for (const op of ops) {
-      const opChar = op.op;
-      const len = op.length;
-      if (opChar === "S" || opChar === "H") {
-        if (opChar === "S") seqPos += len;
-        continue;
-      }
-      if (opChar === "I" || opChar === "P") {
-        if (opChar === "I") seqPos += len;
-        continue;
-      }
-      if (opChar === "D" || opChar === "N") {
-        refPos += len;
-        continue;
-      }
-      if (matchesMatch(opChar)) {
-        for (let k = 0; k < len; k++) {
-          const p = refPos + k;
-          if (p < viewStart || p >= viewEnd) continue;
-          const i = p - viewStart;
-          depth[i]! += 1;
-          const base = r.sequence[seqPos + k] ?? "";
-          if (p >= ref.start && p < ref.end) {
-            const rb = ref.sequence[p - ref.start] ?? "";
-            if (base && rb && base.toUpperCase() !== rb.toUpperCase()) {
-              counts[i]! += 1;
-            }
-          }
-        }
-        refPos += len;
-        seqPos += len;
-      }
+  {
+    let lo = 0;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (reads[mid]!.start < end) lo = mid + 1;
+      else hi = mid;
     }
   }
 
-  const frac = new Float32Array(n);
-  for (let i = 0; i < n; i++) {
-    frac[i] = depth[i]! > 0 ? counts[i]! / depth[i]! : 0;
+  // Scan [0, hi). Early-starting reads that end before `start` are skipped;
+  // those that still cover the window are kept. Cap is small (engine max ~50k).
+  const out: AlignmentRead[] = [];
+  for (let i = 0; i < hi; i++) {
+    const r = reads[i]!;
+    if (r.end > start) out.push(r);
   }
-  return frac;
+  return out;
 }

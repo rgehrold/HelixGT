@@ -9,6 +9,8 @@ use serde::Serialize;
 use crate::convert::open_buf_reader;
 use crate::format::{infer_format, is_gzipped, FileFormat};
 
+use super::contig::resolve_contig_name;
+
 /// Hard cap on features returned for one viewport request (keeps IPC small).
 pub const MAX_FEATURES_PER_WINDOW: usize = 2_500;
 
@@ -65,6 +67,8 @@ struct CachedAnnotations {
     features: Vec<AnnotationFeature>,
     /// contig → sorted feature indices by start
     by_contig: HashMap<String, Vec<usize>>,
+    /// contig → max feature length (for overlap binary search)
+    max_len: HashMap<String, u64>,
     contigs: Vec<String>,
     contig_spans: Vec<AnnotationContigSpan>,
 }
@@ -136,6 +140,7 @@ pub fn open_annotation_document(path: &Path) -> Result<AnnotationDocument> {
 
     let mut by_contig: HashMap<String, Vec<usize>> = HashMap::new();
     let mut max_end: HashMap<String, u64> = HashMap::new();
+    let mut max_len: HashMap<String, u64> = HashMap::new();
     for (index, feature) in features.iter().enumerate() {
         by_contig
             .entry(feature.contig.clone())
@@ -143,6 +148,9 @@ pub fn open_annotation_document(path: &Path) -> Result<AnnotationDocument> {
             .push(index);
         let entry = max_end.entry(feature.contig.clone()).or_insert(0);
         *entry = (*entry).max(feature.end);
+        let span = feature.end.saturating_sub(feature.start);
+        let len_ent = max_len.entry(feature.contig.clone()).or_insert(0);
+        *len_ent = (*len_ent).max(span);
     }
     for indices in by_contig.values_mut() {
         indices.sort_by_key(|&i| features[i].start);
@@ -171,6 +179,7 @@ pub fn open_annotation_document(path: &Path) -> Result<AnnotationDocument> {
             CachedAnnotations {
                 features,
                 by_contig,
+                max_len,
                 contigs,
                 contig_spans,
             },
@@ -193,6 +202,18 @@ pub fn get_features_in_range(
     start: u64,
     end: u64,
 ) -> Result<FeatureWindow> {
+    get_features_in_range_filtered(path, contig, start, end, None)
+}
+
+/// `feature_types` is a case-insensitive allow-list of GFF `type` / BED feature types.
+/// Empty / None = all types.
+pub fn get_features_in_range_filtered(
+    path: &Path,
+    contig: &str,
+    start: u64,
+    end: u64,
+    feature_types: Option<&[String]>,
+) -> Result<FeatureWindow> {
     if start >= end {
         bail!("invalid window: start ({start}) must be < end ({end})");
     }
@@ -213,9 +234,12 @@ pub fn get_features_in_range(
         .get(&key)
         .with_context(|| format!("annotation not in cache: {}", path.display()))?;
 
-    let Some(indices) = cached.by_contig.get(contig) else {
+    let resolved = resolve_contig_name(cached.contigs.iter().map(|s| s.as_str()), contig)
+        .unwrap_or_else(|| contig.to_string());
+
+    let Some(indices) = cached.by_contig.get(&resolved) else {
         return Ok(FeatureWindow {
-            contig: contig.to_string(),
+            contig: resolved,
             start,
             end,
             features: Vec::new(),
@@ -224,16 +248,32 @@ pub fn get_features_in_range(
         });
     };
 
-    // indices sorted by start. Collect overlapping [start, end).
+    let type_filter: Option<Vec<String>> = feature_types.and_then(|types| {
+        if types.is_empty() {
+            None
+        } else {
+            Some(types.iter().map(|t| t.to_ascii_lowercase()).collect())
+        }
+    });
+
+    let max_len = cached.max_len.get(&resolved).copied().unwrap_or(0);
+    // First index whose start could still overlap [start, end).
+    let min_start = start.saturating_sub(max_len);
+    let lo = indices.partition_point(|&i| cached.features[i].start < min_start);
+    let hi = indices.partition_point(|&i| cached.features[i].start < end);
+
     let mut matches = Vec::new();
-    for &idx in indices {
+    for &idx in &indices[lo..hi] {
         let feature = &cached.features[idx];
-        if feature.start >= end {
-            break;
+        if feature.end <= start {
+            continue;
         }
-        if feature.end > start {
-            matches.push(feature.clone());
+        if let Some(ref allow) = type_filter {
+            if !allow.iter().any(|t| t.eq_ignore_ascii_case(&feature.feature_type)) {
+                continue;
+            }
         }
+        matches.push(feature.clone());
     }
 
     let total_in_range = matches.len() as u64;
@@ -243,7 +283,7 @@ pub fn get_features_in_range(
     }
 
     Ok(FeatureWindow {
-        contig: contig.to_string(),
+        contig: resolved,
         start,
         end,
         features: matches,
@@ -401,5 +441,32 @@ mod tests {
         assert_eq!(window.features[0].start, 0);
         assert_eq!(window.features[0].end, 10);
         assert_eq!(window.features[0].strand, "+");
+    }
+
+    #[test]
+    fn contig_alias_and_type_filter() {
+        clear_annotation_cache(None);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mini.gff");
+        let mut file = std::fs::File::create(&path).unwrap();
+        writeln!(file, "##gff-version 3").unwrap();
+        writeln!(file, "chr1\t.\tgene\t1\t10\t.\t+\t.\tID=g1").unwrap();
+        writeln!(file, "chr1\t.\texon\t2\t8\t.\t+\t.\tID=e1").unwrap();
+        writeln!(file, "chr1\t.\tCDS\t3\t7\t.\t+\t.\tID=c1").unwrap();
+
+        open_annotation_document(&path).unwrap();
+        let via_alias = get_features_in_range(&path, "1", 0, 15).unwrap();
+        assert_eq!(via_alias.features.len(), 3);
+
+        let genes = get_features_in_range_filtered(
+            &path,
+            "1",
+            0,
+            15,
+            Some(&["gene".to_string()]),
+        )
+        .unwrap();
+        assert_eq!(genes.features.len(), 1);
+        assert_eq!(genes.features[0].feature_type, "gene");
     }
 }

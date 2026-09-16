@@ -6,6 +6,7 @@ import type {
   AnnotationDocument,
   ConvertProgress,
   ConvertSummary,
+  AlignmentWindow,
   CoverageWindow,
   FastqQcSummary,
   FeatureWindow,
@@ -131,6 +132,7 @@ export async function viewGetFeaturesInRange(request: {
   contig: string;
   start: number;
   end: number;
+  featureTypes?: string[] | null;
 }) {
   return invoke<FeatureWindow>("view_get_features_in_range", { request });
 }
@@ -149,8 +151,43 @@ export async function viewGetCoverageBins(request: {
   end: number;
   binCount?: number;
   referencePath?: string | null;
+  includeSecondary?: boolean;
+  includeSupplementary?: boolean;
+  includeDuplicates?: boolean;
+  minMapq?: number;
 }) {
   return invoke<CoverageWindow>("view_get_coverage_bins", { request });
+}
+
+export async function viewGetAlignmentWindow(request: {
+  path: string;
+  contig: string;
+  start: number;
+  end: number;
+  binCount?: number;
+  referencePath?: string | null;
+  includeSecondary?: boolean;
+  includeSupplementary?: boolean;
+  includeDuplicates?: boolean;
+  minMapq?: number;
+  includeSequences?: boolean;
+  includeReads?: boolean;
+}) {
+  return invoke<AlignmentWindow>("view_get_alignment_window", { request });
+}
+
+export async function viewGetOverviewCoverage(request: {
+  path: string;
+  contig: string;
+  contigLength: number;
+  binCount?: number;
+  referencePath?: string | null;
+  includeSecondary?: boolean;
+  includeSupplementary?: boolean;
+  includeDuplicates?: boolean;
+  minMapq?: number;
+}) {
+  return invoke<CoverageWindow>("view_get_overview_coverage", { request });
 }
 
 export async function viewGetReadsInRange(request: {

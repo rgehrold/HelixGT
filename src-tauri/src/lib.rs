@@ -8,15 +8,16 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use converter_core::{
-    align_reads_to_reference, batch_convert, fastq_qc, get_coverage_bins, get_features_in_range,
+    align_reads_to_reference, batch_convert, fastq_qc, get_alignment_window,
+    get_coverage_bins_filtered, get_features_in_range_filtered, get_overview_coverage,
     get_reads_in_range_filtered, get_sequence_window, is_compatible_file, merge_files,
     open_alignment_document, open_annotation_document, open_sequence_document,
     output_alignment_path, resolve_minimap2_path, resolve_samtools_path, run_preflight,
     suggest_merge_filename, suggest_output_format, validate_merge_inputs, AlignOptions,
-    AlignOutputFormat, AlignmentDocument, AnnotationDocument, ConvertOptions, ConvertedFile,
-    CoverageWindow, FastqQcSummary, FeatureWindow, FileFormat, MergeOptions, Minimap2Options,
-    Minimap2Preset, PreflightMode, PreflightReport, PreflightRequest, ReadQueryOptions, ReadsWindow,
-    SequenceDocument, SequenceSlice, ToolLogSink, ToolPaths,
+    AlignOutputFormat, AlignmentDocument, AlignmentWindow, AnnotationDocument, ConvertOptions,
+    ConvertedFile, CoverageWindow, FastqQcSummary, FeatureWindow, FileFormat, MergeOptions,
+    Minimap2Options, Minimap2Preset, PreflightMode, PreflightReport, PreflightRequest,
+    ReadQueryOptions, ReadsWindow, SequenceDocument, SequenceSlice, ToolLogSink, ToolPaths,
 };
 use jobs::JobManager;
 
@@ -326,6 +327,7 @@ struct FeatureWindowRequest {
     contig: String,
     start: u64,
     end: u64,
+    feature_types: Option<Vec<String>>,
 }
 
 #[tauri::command]
@@ -340,11 +342,12 @@ async fn view_open_annotation(path: String) -> Result<AnnotationDocument, String
 #[tauri::command]
 async fn view_get_features_in_range(request: FeatureWindowRequest) -> Result<FeatureWindow, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        get_features_in_range(
+        get_features_in_range_filtered(
             PathBuf::from(request.path).as_path(),
             &request.contig,
             request.start,
             request.end,
+            request.feature_types.as_deref(),
         )
         .map_err(|error| format!("{error:#}"))
     })
@@ -368,6 +371,41 @@ struct CoverageWindowRequest {
     end: u64,
     bin_count: Option<usize>,
     reference_path: Option<String>,
+    include_secondary: Option<bool>,
+    include_supplementary: Option<bool>,
+    include_duplicates: Option<bool>,
+    min_mapq: Option<u8>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AlignmentWindowRequest {
+    path: String,
+    contig: String,
+    start: u64,
+    end: u64,
+    bin_count: Option<usize>,
+    reference_path: Option<String>,
+    include_secondary: Option<bool>,
+    include_supplementary: Option<bool>,
+    include_duplicates: Option<bool>,
+    min_mapq: Option<u8>,
+    include_sequences: Option<bool>,
+    include_reads: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OverviewCoverageRequest {
+    path: String,
+    contig: String,
+    contig_length: u64,
+    bin_count: Option<usize>,
+    reference_path: Option<String>,
+    include_secondary: Option<bool>,
+    include_supplementary: Option<bool>,
+    include_duplicates: Option<bool>,
+    min_mapq: Option<u8>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -410,7 +448,7 @@ async fn view_get_coverage_bins(
 ) -> Result<CoverageWindow, String> {
     let tools = tool_paths_for_app(&app);
     tauri::async_runtime::spawn_blocking(move || {
-        get_coverage_bins(
+        get_coverage_bins_filtered(
             PathBuf::from(request.path).as_path(),
             &tools,
             &request.contig,
@@ -418,6 +456,13 @@ async fn view_get_coverage_bins(
             request.end,
             request.bin_count.unwrap_or(200),
             request.reference_path.as_deref().map(PathBuf::from).as_deref(),
+            &ReadQueryOptions {
+                include_secondary: request.include_secondary.unwrap_or(true),
+                include_supplementary: request.include_supplementary.unwrap_or(true),
+                include_duplicates: request.include_duplicates.unwrap_or(true),
+                min_mapq: request.min_mapq.unwrap_or(0),
+                include_sequences: false,
+            },
         )
         .map_err(|error| format!("{error:#}"))
     })
@@ -444,13 +489,72 @@ async fn view_get_reads_in_range(
                 include_supplementary: request.include_supplementary.unwrap_or(false),
                 include_duplicates: request.include_duplicates.unwrap_or(false),
                 min_mapq: request.min_mapq.unwrap_or(0),
-                include_sequences: request.include_sequences.unwrap_or(true),
+                // Default FALSE — sequences are huge; only when the UI explicitly asks.
+                include_sequences: request.include_sequences.unwrap_or(false),
             },
         )
         .map_err(|error| format!("{error:#}"))
     })
     .await
     .map_err(|error| format!("reads task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn view_get_alignment_window(
+    app: AppHandle,
+    request: AlignmentWindowRequest,
+) -> Result<AlignmentWindow, String> {
+    let tools = tool_paths_for_app(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        get_alignment_window(
+            PathBuf::from(request.path).as_path(),
+            &tools,
+            &request.contig,
+            request.start,
+            request.end,
+            request.bin_count.unwrap_or(200),
+            request.reference_path.as_deref().map(PathBuf::from).as_deref(),
+            &ReadQueryOptions {
+                include_secondary: request.include_secondary.unwrap_or(false),
+                include_supplementary: request.include_supplementary.unwrap_or(false),
+                include_duplicates: request.include_duplicates.unwrap_or(false),
+                min_mapq: request.min_mapq.unwrap_or(0),
+                include_sequences: request.include_sequences.unwrap_or(false),
+            },
+            request.include_reads.unwrap_or(true),
+        )
+        .map_err(|error| format!("{error:#}"))
+    })
+    .await
+    .map_err(|error| format!("alignment window task failed: {error}"))?
+}
+
+#[tauri::command]
+async fn view_get_overview_coverage(
+    app: AppHandle,
+    request: OverviewCoverageRequest,
+) -> Result<CoverageWindow, String> {
+    let tools = tool_paths_for_app(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        get_overview_coverage(
+            PathBuf::from(request.path).as_path(),
+            &tools,
+            &request.contig,
+            request.contig_length,
+            request.bin_count.unwrap_or(240),
+            request.reference_path.as_deref().map(PathBuf::from).as_deref(),
+            &ReadQueryOptions {
+                include_secondary: request.include_secondary.unwrap_or(false),
+                include_supplementary: request.include_supplementary.unwrap_or(false),
+                include_duplicates: request.include_duplicates.unwrap_or(false),
+                min_mapq: request.min_mapq.unwrap_or(0),
+                include_sequences: false,
+            },
+        )
+        .map_err(|error| format!("{error:#}"))
+    })
+    .await
+    .map_err(|error| format!("overview coverage task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -493,42 +597,61 @@ fn save_user_preferences(app: AppHandle, prefs: UserPreferences) -> Result<(), S
     crate::user_preferences::save_user_preferences(&app, prefs)
 }
 
+/// Disk listing can be slow on network/USB drives. Always run off the async
+/// runtime so View's BAM/CRAM spawn_blocking work cannot starve the file browser.
 #[tauri::command]
-fn list_browse_directory(path: String) -> Result<Vec<DirEntry>, String> {
-    list_directory(PathBuf::from(path).as_path())
+async fn list_browse_directory(path: String) -> Result<Vec<DirEntry>, String> {
+    tauri::async_runtime::spawn_blocking(move || list_directory(PathBuf::from(path).as_path()))
+        .await
+        .map_err(|error| format!("list directory task failed: {error}"))?
 }
 
 #[tauri::command]
-fn collect_compatible_files_under(path: String) -> Result<Vec<String>, String> {
-    collect_compatible_files(PathBuf::from(path).as_path())
+async fn collect_compatible_files_under(path: String) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        collect_compatible_files(PathBuf::from(path).as_path())
+    })
+    .await
+    .map_err(|error| format!("collect files task failed: {error}"))?
 }
 
 #[tauri::command]
-fn browse_folder_has_compatible_files(path: String) -> Result<bool, String> {
-    folder_has_compatible_files(PathBuf::from(path).as_path())
+async fn browse_folder_has_compatible_files(path: String) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        folder_has_compatible_files(PathBuf::from(path).as_path())
+    })
+    .await
+    .map_err(|error| format!("folder check task failed: {error}"))?
 }
 
 #[tauri::command]
-fn rename_browse_path(path: String, new_name: String) -> Result<String, String> {
-    rename_path(PathBuf::from(path).as_path(), &new_name)
+async fn rename_browse_path(path: String, new_name: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || rename_path(PathBuf::from(path).as_path(), &new_name))
+        .await
+        .map_err(|error| format!("rename task failed: {error}"))?
 }
 
 #[tauri::command]
-fn delete_browse_path(path: String) -> Result<(), String> {
-    delete_path(PathBuf::from(path).as_path())
+async fn delete_browse_path(path: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || delete_path(PathBuf::from(path).as_path()))
+        .await
+        .map_err(|error| format!("delete task failed: {error}"))?
 }
 
 #[tauri::command]
-fn browse_folder_child_count(path: String) -> Result<u64, String> {
-    folder_child_count(PathBuf::from(path).as_path())
+async fn browse_folder_child_count(path: String) -> Result<u64, String> {
+    tauri::async_runtime::spawn_blocking(move || folder_child_count(PathBuf::from(path).as_path()))
+        .await
+        .map_err(|error| format!("folder count task failed: {error}"))?
 }
 
 #[tauri::command]
-fn create_browse_folder(parent_path: String, name: Option<String>) -> Result<String, String> {
-    create_folder(
-        PathBuf::from(parent_path).as_path(),
-        name.as_deref(),
-    )
+async fn create_browse_folder(parent_path: String, name: Option<String>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        create_folder(PathBuf::from(parent_path).as_path(), name.as_deref())
+    })
+    .await
+    .map_err(|error| format!("create folder task failed: {error}"))?
 }
 
 #[tauri::command]
@@ -935,7 +1058,9 @@ pub fn run() {
             view_get_features_in_range,
             view_open_alignment,
             view_get_coverage_bins,
-            view_get_reads_in_range
+            view_get_reads_in_range,
+            view_get_alignment_window,
+            view_get_overview_coverage
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

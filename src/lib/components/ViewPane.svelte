@@ -3,8 +3,10 @@
   import { open } from "@tauri-apps/plugin-dialog";
   import InfoLink from "$lib/components/InfoLink.svelte";
   import {
+    viewGetAlignmentWindow,
     viewGetCoverageBins,
     viewGetFeaturesInRange,
+    viewGetOverviewCoverage,
     viewGetReadsInRange,
     viewGetSequenceWindow,
     viewOpenAlignment,
@@ -22,31 +24,44 @@
     SequenceSlice,
   } from "$lib/types";
   import {
-    BASE_LETTERS_MAX_BP,
     FEATURE_FETCH_DEBOUNCE_MS,
     FETCH_DEBOUNCE_IDLE_MS,
-    FETCH_DEBOUNCE_PAN_MS,
     GUTTER_WIDTH,
     KEY_PAN_FRACTION,
     MAX_SEQUENCE_WINDOW_BP,
     MIN_VISIBLE_BP,
+    NAV_IDLE_MS,
     PAD_L,
     PAD_R,
+    OVERVIEW_BINS,
     READ_FETCH_MAX_BP,
     READ_LANE_H,
+    READ_SEQUENCES_MAX_BP,
+    READS_HEADER_H,
     SEQ_PREFETCH_CHUNK_BP,
     SEQ_PREFETCH_PAD_BP,
+    VIEW_SIDE_PAD_FRACTION,
     ZOOM_IN_FACTOR,
     ZOOM_OUT_FACTOR,
   } from "$lib/view/constants";
   import {
-    cacheCoversWindow,
-    cacheNearEdge,
     computeCoverageFetchWindow,
     computeReadFetchWindow,
     coverageCacheCovers,
+    coverageCacheDenseEnough,
     coverageNearEdge,
+    desiredCoverageBinCount,
+    maxDepthInView,
+    readCacheCanDisplay,
+    readCacheUsable,
+    cacheNearEdge,
   } from "$lib/view/fetch";
+  import {
+    contigNameAliases,
+    featureTypesForFilter,
+    findContigLength,
+    resolveContigName,
+  } from "$lib/view/contig";
   import {
     computeUnifiedLayout,
     defaultVisibleBp,
@@ -61,7 +76,7 @@
     packReadsSquish,
     readFilterKey,
     readsOverlapWindow,
-    type PackedRead,
+    type PackReadsResult,
   } from "$lib/view/reads";
   import { paintFixedTracks, paintReadsTrack, type LocalBuffer } from "$lib/view/paint";
 
@@ -92,6 +107,8 @@
     reads: AlignmentRead[];
     totalInRange: number;
     truncated: boolean;
+    /** Whether this sample includes per-base sequence/qualities. */
+    hasSequences: boolean;
   };
 
   type CoverageCache = {
@@ -113,18 +130,37 @@
     totalInRange: number;
   };
 
+  type AlignTrackState = {
+    path: string;
+    label: string;
+    doc: AlignmentDocument;
+    visible: boolean;
+    coverageBins: CoverageBin[];
+    coverageMax: number;
+    coverageCache: CoverageCache | null;
+    overviewBins: CoverageBin[];
+    overviewMax: number;
+    alignmentReads: AlignmentRead[];
+    readsTruncated: boolean;
+    readsTotal: number;
+    readCache: ReadCache | null;
+    readPack: PackReadsResult;
+  };
+
   let seqDoc = $state<SequenceDocument | null>(null);
   let annDocs = $state<AnnotationDocument[]>([]);
   let annTrackStates = $state<AnnTrackState[]>([]);
-  let alignDoc = $state<AlignmentDocument | null>(null);
+  let alignTracks = $state<AlignTrackState[]>([]);
+  let featureTypeFilter = $state<"all" | "genes" | "exons" | "cds">("all");
+  const alignDoc = $derived(alignTracks[0]?.doc ?? null);
   let selectedFeature = $state<AnnotationFeature | null>(null);
-  let coverageBins = $state<CoverageBin[]>([]);
-  let coverageMax = $state(0);
-  let alignmentReads = $state<AlignmentRead[]>([]);
-  let readsTruncated = $state(false);
-  let readsTotal = $state(0);
-  let readCache = $state<ReadCache | null>(null);
-  let coverageCache = $state<CoverageCache | null>(null);
+  const coverageBins = $derived(alignTracks[0]?.coverageBins ?? []);
+  const coverageMax = $derived(alignTracks[0]?.coverageMax ?? 0);
+  const alignmentReads = $derived(alignTracks[0]?.alignmentReads ?? []);
+  const readsTruncated = $derived(alignTracks[0]?.readsTruncated ?? false);
+  const readsTotal = $derived(alignTracks[0]?.readsTotal ?? 0);
+  const readCache = $derived(alignTracks[0]?.readCache ?? null);
+  const coverageCache = $derived(alignTracks[0]?.coverageCache ?? null);
   let selectedRead = $state<AlignmentRead | null>(null);
   let selectedCoverage = $state<CoverageBin | null>(null);
 
@@ -135,9 +171,11 @@
   let hideSupplementary = $state(true);
   let hideDuplicates = $state(true);
   let minMapq = $state(0);
-  let colorReadsBy = $state<"strand" | "mapq" | "pair" | "none">("strand");
-  let colorMismatches = $state(false);
-  let colorBases = $state(false);
+  /** Default: uniform grey (IGV-style); strand/MAPQ/pair available in Filters. */
+  let colorReadsBy = $state<"strand" | "mapq" | "pair" | "none">("none");
+  /** Mismatch highlights on reads when zoomed in (coverage stays simple grey depth). */
+  let colorMismatches = $state(true);
+  let colorBases = $state(true);
   let reverseComplement = $state(false);
 
   let contig = $state("");
@@ -149,6 +187,8 @@
   let isFetchingSlice = $state(false);
   let isFetchingFeatures = $state(false);
   let isFetchingAlign = $state(false);
+  /** If a fetch was skipped because one was already in flight, re-run once it ends. */
+  let alignFetchNeedsRerun = false;
   let errorMessage = $state("");
   let statusMessage = $state("Open FASTA, GFF/BED, and/or indexed BAM/CRAM.");
   let pendingCramPath = $state<string | null>(null);
@@ -156,6 +196,9 @@
   let canvasEl = $state<HTMLCanvasElement | null>(null);
   let readsCanvasEl = $state<HTMLCanvasElement | null>(null);
   let wrapEl = $state<HTMLDivElement | null>(null);
+  let plotsEl = $state<HTMLDivElement | null>(null);
+  /** Reactive plot width — updated via ResizeObserver so the canvas tracks window/pane size. */
+  let layoutWidth = $state(640);
   let locusInput = $state("");
   let locusEditing = $state(false);
   let openMenu = $state<"display" | "filters" | null>(null);
@@ -165,6 +208,12 @@
   let dragOrigin = $state<number | null>(null);
   let isPanning = $state(false);
   let isOverviewDragging = $state(false);
+  /**
+   * True during continuous navigation (wheel pan/zoom, arrow keys, zoom buttons).
+   * Pointer drag uses isPanning / isOverviewDragging instead.
+   * While true, never start uncancelable BAM/CRAM/FASTA IPC — paint from cache only.
+   */
+  let isNavigating = $state(false);
   let panOriginX = $state(0);
   let panOriginStart = $state(0);
 
@@ -175,17 +224,138 @@
   let prefetchTimer: ReturnType<typeof setTimeout> | null = null;
   let alignDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   let featureDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  let navIdleTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Coalesce high-frequency pan/wheel viewStart updates to one per frame. */
+  let panRaf = 0;
+  let pendingViewStart: number | null = null;
+  /**
+   * Frozen pileup packing while the user navigates. Re-packing thousands of
+   * reads on every pointermove monopolizes the webview event loop and makes
+   * the file browser / menus feel dead.
+   */
+  const readPack = $derived(
+    alignTracks[0]?.readPack ?? { packed: [], laneCount: 1, hiddenCount: 0 },
+  );
   let paintRaf = 0;
+  let paintReadsRaf = 0;
+
+  /** Any active gesture that should block disk fetches. */
+  function viewportBusy(): boolean {
+    return isPanning || isOverviewDragging || isNavigating;
+  }
+
+  function emptyPack(): PackReadsResult {
+    return { packed: [], laneCount: 1, hiddenCount: 0 };
+  }
+
+  function recomputeReadPack() {
+    if (!showReadPileup || alignTracks.length === 0 || visibleBp > READ_FETCH_MAX_BP) {
+      alignTracks = alignTracks.map((t) => ({ ...t, readPack: emptyPack() }));
+      return;
+    }
+    alignTracks = alignTracks.map((t) => ({
+      ...t,
+      readPack: packReadsSquish(t.alignmentReads, viewStart, viewEnd),
+    }));
+  }
+
+  /**
+   * Apply a new viewStart, optionally coalesced to animation frames so
+   * Svelte/$effect/paint run at most ~60×/s during continuous gestures.
+   */
+  function setViewStart(next: number, coalesce: boolean) {
+    if (!coalesce) {
+      if (panRaf) {
+        cancelAnimationFrame(panRaf);
+        panRaf = 0;
+      }
+      pendingViewStart = null;
+      viewStart = next;
+      clampWindow();
+      return;
+    }
+    pendingViewStart = next;
+    if (panRaf) return;
+    panRaf = requestAnimationFrame(() => {
+      panRaf = 0;
+      if (pendingViewStart == null) return;
+      viewStart = pendingViewStart;
+      pendingViewStart = null;
+      clampWindow();
+    });
+  }
+
+  /**
+   * Mark continuous nav (wheel/keys/zoom). Cancels pending fetch timers and
+   * only schedules one network refresh after the user pauses.
+   */
+  function markNavigating() {
+    isNavigating = true;
+    if (navIdleTimer) clearTimeout(navIdleTimer);
+    // Drop any pending network work — results of in-flight jobs are discarded
+    // via tokens when they return; we just refuse to *start* more while busy.
+    if (alignDebounceTimer) {
+      clearTimeout(alignDebounceTimer);
+      alignDebounceTimer = null;
+    }
+    if (prefetchTimer) {
+      clearTimeout(prefetchTimer);
+      prefetchTimer = null;
+    }
+    if (featureDebounceTimer) {
+      clearTimeout(featureDebounceTimer);
+      featureDebounceTimer = null;
+    }
+    // Paint only — do not re-filter caches every wheel tick (main-thread thrash).
+    schedulePaint();
+    navIdleTimer = setTimeout(() => {
+      isNavigating = false;
+      navIdleTimer = null;
+      // Flush any coalesced pan first.
+      if (pendingViewStart != null) {
+        viewStart = pendingViewStart;
+        pendingViewStart = null;
+        clampWindow();
+      }
+      applyAlignmentFromCaches();
+      recomputeReadPack();
+      if (seqDoc) refreshVisibleSlice();
+      if (featureDebounceTimer) clearTimeout(featureDebounceTimer);
+      featureDebounceTimer = setTimeout(() => void refreshFeatures(), FEATURE_FETCH_DEBOUNCE_MS);
+      refreshAlignmentTracksDebounced();
+    }, NAV_IDLE_MS);
+  }
+
+  function contigsShareName(
+    a: { name: string }[],
+    b: { name: string }[],
+  ): string | null {
+    for (const ac of a) {
+      for (const alias of contigNameAliases(ac.name)) {
+        if (b.some((bc) => bc.name === alias || bc.name.toLowerCase() === alias.toLowerCase())) {
+          return ac.name;
+        }
+      }
+    }
+    return null;
+  }
 
   const contigLength = $derived.by(() => {
-    const fromSeq = seqDoc?.contigs.find((c) => c.name === contig)?.length;
+    const fromSeq = findContigLength(seqDoc?.contigs, contig);
     if (fromSeq && fromSeq > 0) return fromSeq;
-    const fromAln = alignDoc?.contigs.find((c) => c.name === contig)?.length;
+    let fromAln: number | null = null;
+    for (const t of alignTracks) {
+      fromAln = findContigLength(t.doc.contigs, contig);
+      if (fromAln) break;
+    }
     if (fromAln && fromAln > 0) return fromAln;
     let max = 0;
     for (const doc of annDocs) {
-      const span = doc.contigSpans?.find((s) => s.name === contig);
-      if (span) max = Math.max(max, span.length);
+      const spanLen = findContigLength(
+        (doc.contigSpans ?? []).map((s) => ({ name: s.name, length: s.length })),
+        contig,
+      );
+      if (spanLen) max = Math.max(max, spanLen);
     }
     return max;
   });
@@ -197,19 +367,26 @@
   const selectedAnnotationPaths = $derived(
     selectedPaths.filter((path) => /\.(gff|gff3|bed)(\.gz)?$/i.test(path)),
   );
-  const selectedAlignmentPath = $derived(
-    selectedPaths.find((path) => /\.(bam|cram)$/i.test(path)) ?? null,
+  const selectedAlignmentPaths = $derived(
+    selectedPaths.filter((path) => /\.(bam|cram)$/i.test(path)),
   );
-  const selectedIsCram = $derived(!!selectedAlignmentPath && /\.cram$/i.test(selectedAlignmentPath));
+  const selectedAlignmentPath = $derived(selectedAlignmentPaths[0] ?? null);
+  const selectedIsCram = $derived(selectedAlignmentPaths.some((p) => /\.cram$/i.test(p)));
   const openIsCram = $derived(
-    !!alignDoc && (alignDoc.requiresReference || /\.cram$/i.test(alignDoc.path)),
+    alignTracks.some((t) => t.doc.requiresReference || /\.cram$/i.test(t.doc.path)),
   );
   const showCramReferenceField = $derived(selectedIsCram || openIsCram || !!pendingCramPath);
   const cramReferenceReady = $derived(referencePath.trim().length > 0);
 
   const contigOptions = $derived.by(() => {
     if (seqDoc) return seqDoc.contigs.map((c) => ({ name: c.name, length: c.length }));
-    if (alignDoc) return alignDoc.contigs.map((c) => ({ name: c.name, length: c.length }));
+    if (alignTracks.length > 0) {
+      const map = new Map<string, number>();
+      for (const t of alignTracks) {
+        for (const c of t.doc.contigs) map.set(c.name, Math.max(map.get(c.name) ?? 0, c.length));
+      }
+      return [...map.entries()].map(([name, length]) => ({ name, length }));
+    }
     const map = new Map<string, number>();
     for (const doc of annDocs) {
       for (const span of doc.contigSpans ?? []) {
@@ -219,15 +396,69 @@
     return [...map.entries()].map(([name, length]) => ({ name, length }));
   });
 
-  const hasDocument = $derived(!!seqDoc || annDocs.length > 0 || !!alignDoc);
-  const showSeqTrack = $derived(!!seqDoc && showSeqTrackVisible);
-  const showCovTrack = $derived(!!alignDoc && showCoverage);
-  const showReadsTrack = $derived(!!alignDoc && showReadPileup);
-  const plotWidth = $derived(Math.max(200, (wrapEl?.clientWidth ?? 640) - GUTTER_WIDTH));
+  const hasDocument = $derived(!!seqDoc || annDocs.length > 0 || alignTracks.length > 0);
+  const seqAvailable = $derived(hasDocument);
+  const covAvailable = $derived(alignTracks.length > 0);
+  const readsAvailable = $derived(alignTracks.length > 0);
+  const showSeqTrack = $derived(seqAvailable && showSeqTrackVisible);
+  const showCovTrack = $derived(covAvailable && showCoverage);
+  const showReadsTrack = $derived(readsAvailable && showReadPileup);
 
-  const readPack = $derived.by(() =>
-    packReadsSquish(alignmentReads, viewStart, viewEnd),
-  );
+  const plotWidth = $derived(Math.max(200, layoutWidth));
+
+  function coveragePlanForView(): { start: number; end: number; binCount: number } {
+    const { start, end } = computeCoverageFetchWindow(
+      viewStart,
+      viewEnd,
+      contigLength,
+      visibleBp,
+    );
+    const binCount = desiredCoverageBinCount(end - start, plotWidth);
+    return { start, end, binCount };
+  }
+
+  function layoutTracksInput() {
+    const densityOnly = visibleBp > READ_FETCH_MAX_BP;
+    return {
+      seqAvailable,
+      seqExpanded: showSeqTrackVisible,
+      covTracks: alignTracks.map((t) => ({
+        path: t.path,
+        label: t.label,
+        expanded: showCoverage && t.visible,
+      })),
+      annTracks: annTrackStates.map((t) => ({
+        path: t.path,
+        label: t.label,
+        expanded: t.visible,
+        laneCount: estimateFeatureLanes(t.features, viewStart, viewEnd),
+      })),
+      readsTracks: alignTracks.map((t) => ({
+        path: t.path,
+        label: t.label,
+        expanded: showReadPileup && t.visible,
+        laneCount: t.readPack.laneCount,
+        densityOnly,
+      })),
+    };
+  }
+
+  // Recompute pileup packing only when idle — freezes lane assignment during pan/zoom.
+
+
+  function measurePlotWidth() {
+    const el = plotsEl ?? wrapEl;
+    if (!el) return;
+    const w = el.clientWidth;
+    // When measuring the full viewer, subtract the gutter.
+    const next = Math.max(
+      200,
+      plotsEl ? w : Math.max(0, w - GUTTER_WIDTH),
+    );
+    if (Math.abs(next - layoutWidth) >= 1) {
+      layoutWidth = next;
+    }
+  }
 
   $effect(() => {
     if (locusEditing || !contig) return;
@@ -259,11 +490,18 @@
     hideSupplementary;
     hideDuplicates;
     minMapq;
+    featureTypeFilter;
     // Track annotation *document* list (open/close), not per-track feature arrays.
     annDocs;
     if (reverseComplement !== lastRc) {
       lastRc = reverseComplement;
       localBuffer = null;
+    }
+    // Skip all disk IPC while the user is still navigating (pan/zoom/wheel/keys).
+    // Continuous gestures only paint from cache; markNavigating() re-fetches on idle.
+    if (viewportBusy()) {
+      schedulePaint();
+      return;
     }
     if (seqDoc) refreshVisibleSlice();
     if (featureDebounceTimer) clearTimeout(featureDebounceTimer);
@@ -296,36 +534,187 @@
     colorMismatches;
     colorBases;
     plotWidth;
+    // While navigating, paint is already scheduled from setViewStart/markNavigating —
+    // avoid a second full reactive storm from every dependency listed above.
+    if (viewportBusy()) {
+      schedulePaint();
+      return;
+    }
     schedulePaint();
   });
 
-  // Auto-open pending CRAM when reference is set.
-  let lastAutoRef = "";
+  // When referencePath is set externally (e.g. right-click → Set as reference),
+  // put that FASTA on the Reference track. Also open pending CRAM if waiting.
+  // Guard with lastRefTrackPath so we do not re-open a multi-GB FASTA on every effect tick.
+  let lastRefTrackPath = "";
   $effect(() => {
     const ref = referencePath.trim();
-    if (!ref || ref === lastAutoRef || !pendingCramPath || isLoading) return;
-    lastAutoRef = ref;
-    void openAlignmentPath(pendingCramPath);
+    if (!ref || isLoading) return;
+    const want = ref.replace(/\\/g, "/");
+    if (want === lastRefTrackPath) {
+      if (pendingCramPath) void openAlignmentPath(pendingCramPath);
+      return;
+    }
+    lastRefTrackPath = want;
+    if (pendingCramPath) {
+      void openAlignmentPath(pendingCramPath);
+    }
+    void loadReferenceOntoTrack(ref);
   });
 
+  /** Active pointer id we captured on a canvas — must always be released or the
+   * rest of the app (file browser, mode tabs) stops receiving clicks. */
+  let capturedPointerId: number | null = null;
+  let captureTarget: HTMLCanvasElement | null = null;
+  /** True while we intentionally release capture (suppress lostpointercapture re-entry). */
+  let releasingCapture = false;
+  /** Ignore RO width jitter smaller than this (scrollbar appear/disappear thrash). */
+  let lastObservedPlotWidth = 0;
+
+  function releaseCanvasPointerCapture() {
+    if (captureTarget && capturedPointerId != null) {
+      releasingCapture = true;
+      try {
+        if (captureTarget.hasPointerCapture(capturedPointerId)) {
+          captureTarget.releasePointerCapture(capturedPointerId);
+        }
+      } catch {
+        /* already released */
+      } finally {
+        releasingCapture = false;
+      }
+    }
+    capturedPointerId = null;
+    captureTarget = null;
+  }
+
+  /** End pan/select gesture and free the rest of the UI to receive events. */
+  function endCanvasGesture(opts?: { fromWindow?: boolean }) {
+    const wasPanning = isPanning || isOverviewDragging;
+    const wasSelecting = dragOrigin != null;
+    if (!wasPanning && !wasSelecting && capturedPointerId == null) return;
+    releaseCanvasPointerCapture();
+    isPanning = false;
+    isOverviewDragging = false;
+    dragOrigin = null;
+    if (pendingViewStart != null) {
+      viewStart = pendingViewStart;
+      pendingViewStart = null;
+      clampWindow();
+    }
+    if (panRaf) {
+      cancelAnimationFrame(panRaf);
+      panRaf = 0;
+    }
+    if (wasPanning) {
+      applyAlignmentFromCaches();
+      recomputeReadPack();
+      if (seqDoc) refreshVisibleSlice();
+      refreshAlignmentTracksDebounced();
+    } else if (wasSelecting || opts?.fromWindow) {
+      schedulePaint();
+    }
+  }
+
   onMount(() => {
-    const onResize = () => schedulePaint();
+    const onResize = () => {
+      measurePlotWidth();
+      schedulePaint();
+    };
+    const onTheme = () => schedulePaint();
+    // When the window is backgrounded, stop thrashing the event loop.
+    const onVisibility = () => {
+      if (document.hidden) {
+        endCanvasGesture({ fromWindow: true });
+        if (paintRaf) cancelAnimationFrame(paintRaf);
+        paintRaf = 0;
+        if (paintReadsRaf) cancelAnimationFrame(paintReadsRaf);
+        paintReadsRaf = 0;
+      } else {
+        schedulePaint();
+      }
+    };
+    // Safety net: canvas pointerup can be lost (alt-tab, OS grab). Without this,
+    // setPointerCapture steals every click from the file browser and menus.
+    const onWindowPointerEnd = (event: PointerEvent) => {
+      if (capturedPointerId == null) return;
+      if (event.pointerId !== capturedPointerId) return;
+      endCanvasGesture({ fromWindow: true });
+    };
+    const onWindowBlur = () => endCanvasGesture({ fromWindow: true });
     window.addEventListener("resize", onResize);
+    window.addEventListener("helixgt-theme", onTheme);
+    window.addEventListener("pointerup", onWindowPointerEnd, true);
+    window.addEventListener("pointercancel", onWindowPointerEnd, true);
+    window.addEventListener("blur", onWindowBlur);
+    document.addEventListener("visibilitychange", onVisibility);
     return () => {
       window.removeEventListener("resize", onResize);
+      window.removeEventListener("helixgt-theme", onTheme);
+      window.removeEventListener("pointerup", onWindowPointerEnd, true);
+      window.removeEventListener("pointercancel", onWindowPointerEnd, true);
+      window.removeEventListener("blur", onWindowBlur);
+      document.removeEventListener("visibilitychange", onVisibility);
+      endCanvasGesture({ fromWindow: true });
       if (prefetchTimer) clearTimeout(prefetchTimer);
       if (alignDebounceTimer) clearTimeout(alignDebounceTimer);
       if (featureDebounceTimer) clearTimeout(featureDebounceTimer);
+      if (navIdleTimer) clearTimeout(navIdleTimer);
+      if (panRaf) cancelAnimationFrame(panRaf);
       if (paintRaf) cancelAnimationFrame(paintRaf);
+      if (paintReadsRaf) cancelAnimationFrame(paintReadsRaf);
+    };
+  });
+
+  // Keep layoutWidth in sync with the actual plot area (window + files pane + mode rail).
+  $effect(() => {
+    const el = plotsEl ?? wrapEl;
+    if (!el) return;
+    measurePlotWidth();
+    lastObservedPlotWidth = el.clientWidth;
+    let roRaf = 0;
+    const ro = new ResizeObserver((entries) => {
+      // Width-only: canvas height changes must NOT re-trigger layout (scrollbar loops).
+      const entry = entries[0];
+      const w = entry?.contentRect?.width ?? el.clientWidth;
+      if (Math.abs(w - lastObservedPlotWidth) < 2) return;
+      lastObservedPlotWidth = w;
+      if (roRaf) return;
+      roRaf = requestAnimationFrame(() => {
+        roRaf = 0;
+        measurePlotWidth();
+        schedulePaint();
+      });
+    });
+    ro.observe(el);
+    return () => {
+      ro.disconnect();
+      if (roRaf) cancelAnimationFrame(roRaf);
     };
   });
 
   function schedulePaint() {
+    if (document.hidden) return;
     if (paintRaf) return;
-    // Paint on the next frame only — skip await tick() so pan stays fluid.
+    // During continuous nav: paint next frame (snappy). When idle: one extra
+    // rAF so shell click handlers aren't starved behind canvas work.
     paintRaf = requestAnimationFrame(() => {
       paintRaf = 0;
-      paint();
+      if (viewportBusy()) {
+        paint();
+        return;
+      }
+      paintRaf = requestAnimationFrame(() => {
+        paintRaf = 0;
+        paint();
+      });
+    });
+  }
+
+  /** Let the browser process clicks / paints between heavy IPC apply steps. */
+  function yieldToBrowser(): Promise<void> {
+    return new Promise((resolve) => {
+      setTimeout(resolve, 0);
     });
   }
 
@@ -340,36 +729,16 @@
   }
 
   const viewerLayout = $derived.by(() =>
-    computeUnifiedLayout(plotWidth, {
-      showSeq: showSeqTrack,
-      showCov: showCovTrack,
-      annTracks: annTrackStates.map((t) => ({
-        path: t.path,
-        label: t.label,
-        visible: t.visible,
-        laneCount: estimateFeatureLanes(t.features, viewStart, viewEnd),
-      })),
-      showReads: showReadsTrack,
-      readLaneCount: readPack.laneCount,
-    }),
+    computeUnifiedLayout(plotWidth, layoutTracksInput()),
   );
 
   function paint() {
     if (!canvasEl) return;
-    const pack = readPack;
-    const layout = computeUnifiedLayout(plotWidth, {
-      showSeq: showSeqTrack,
-      showCov: showCovTrack,
-      annTracks: annTrackStates.map((t) => ({
-        path: t.path,
-        label: t.label,
-        visible: t.visible,
-        laneCount: estimateFeatureLanes(t.features, viewStart, viewEnd),
-      })),
-      showReads: showReadsTrack,
-      readLaneCount: pack.laneCount,
-    });
+    if (document.hidden) return;
+    const layout = computeUnifiedLayout(plotWidth, layoutTracksInput());
     const cssW = plotWidth;
+    const busy = viewportBusy();
+    const overviewSrc = alignTracks.find((t) => t.overviewBins.length > 0) ?? alignTracks[0];
     paintFixedTracks({
       canvas: canvasEl,
       layout,
@@ -382,8 +751,13 @@
       slice,
       localBuffer,
       isFetchingSlice,
-      coverageBins,
-      coverageMax,
+      coverageTracks: alignTracks.map((t) => ({
+        path: t.path,
+        bins: t.coverageBins,
+        maxDepth: t.coverageMax,
+      })),
+      overviewBins: overviewSrc?.overviewBins ?? [],
+      overviewMax: overviewSrc?.overviewMax ?? 0,
       isFetchingAlign,
       annTracks: annTrackStates
         .filter((t) => t.visible)
@@ -392,16 +766,18 @@
           features: t.features,
           truncated: t.truncated,
         })),
-      alignmentReads,
       selectedFeature,
       selectedCoverage,
       selectionStart,
       selectionEnd,
-      colorMismatches,
       colorBases,
     });
 
-    if (showReadsTrack && readsCanvasEl) {
+    if (!readsAvailable || !readsCanvasEl) return;
+
+    const packedCount = alignTracks.reduce((n, t) => n + t.readPack.packed.length, 0);
+    const paintReads = () => {
+      if (!readsCanvasEl) return;
       paintReadsTrack({
         canvas: readsCanvasEl,
         layout,
@@ -409,18 +785,39 @@
         viewStart,
         viewEnd,
         visibleBp,
-        packed: pack.packed,
-        hiddenCount: pack.hiddenCount,
+        tracks: alignTracks.map((t) => ({
+          path: t.path,
+          packed: showReadPileup ? t.readPack.packed : [],
+          hiddenCount: showReadPileup ? t.readPack.hiddenCount : 0,
+          truncated: t.readsTruncated,
+          total: t.readsTotal,
+          coverageBins: t.coverageBins,
+          coverageMax: t.coverageMax,
+        })),
         localBuffer,
         contig,
         isFetchingAlign,
-        readsTruncated,
-        readsTotal,
         selectedRead,
         colorReadsBy,
         colorBases,
+        colorMismatches,
         selectionStart,
         selectionEnd,
+        isPanning: busy,
+      });
+    };
+
+    if (busy || packedCount < 400) {
+      if (paintReadsRaf) {
+        cancelAnimationFrame(paintReadsRaf);
+        paintReadsRaf = 0;
+      }
+      paintReads();
+    } else {
+      if (paintReadsRaf) cancelAnimationFrame(paintReadsRaf);
+      paintReadsRaf = requestAnimationFrame(() => {
+        paintReadsRaf = 0;
+        paintReads();
       });
     }
   }
@@ -532,10 +929,25 @@
         path,
         referencePath: isCram ? referencePath.trim() : null,
       });
-      alignDoc = doc;
+      const label = doc.path.split(/[\\/]/).pop() ?? doc.path;
+      const next: AlignTrackState = {
+        path: doc.path,
+        label,
+        doc,
+        visible: true,
+        coverageBins: [],
+        coverageMax: 0,
+        coverageCache: null,
+        overviewBins: [],
+        overviewMax: 0,
+        alignmentReads: [],
+        readsTruncated: false,
+        readsTotal: 0,
+        readCache: null,
+        readPack: emptyPack(),
+      };
+      alignTracks = [...alignTracks.filter((t) => t.path !== doc.path), next];
       pendingCramPath = null;
-      readCache = null;
-      coverageCache = null;
       if (!contig && doc.contigs.length > 0) {
         contig = doc.contigs[0]!.name;
         const len = doc.contigs[0]!.length;
@@ -547,6 +959,8 @@
       );
       statusMessage = `Alignment ${doc.format.toUpperCase()}`;
       clampWindow();
+      // Load a FASTA into the Reference track if the user has not opened one yet.
+      await ensureReferenceSequenceLoaded();
       void refreshAlignmentTracks();
     } catch (error) {
       if (isCram) pendingCramPath = path;
@@ -557,14 +971,97 @@
     }
   }
 
+  function pathsEqualLoose(a: string, b: string): boolean {
+    const norm = (p: string) => p.replace(/\\/g, "/").toLowerCase();
+    return norm(a) === norm(b);
+  }
+
+  /**
+   * Load a FASTA onto the dedicated Reference track without resetting the locus
+   * when contig names still match (e.g. swapping reference while viewing BAM).
+   */
+  async function loadReferenceOntoTrack(path: string) {
+    const candidate = path.trim();
+    if (!candidate) return;
+    // Already on this reference (including fai-backed opens with no full in-memory cache).
+    if (seqDoc && pathsEqualLoose(seqDoc.path, candidate)) {
+      showSeqTrackVisible = true;
+      void prefetchAroundViewport(true);
+      return;
+    }
+    try {
+      statusMessage = `Opening reference ${candidate}…`;
+      const doc = await viewOpenDocument(candidate);
+      seqDoc = doc;
+      referencePath = candidate;
+      lastRefTrackPath = candidate.replace(/\\/g, "/");
+      localBuffer = null;
+      slice = null;
+      showSeqTrackVisible = true;
+      errorMessage = "";
+
+      // Prefer keeping the current contig when names match (incl. chr aliases).
+      const currentOk =
+        !!contig &&
+        (doc.contigs.some((c) => c.name === contig) ||
+          findContigLength(doc.contigs, contig) != null);
+      if (currentOk) {
+        // Keep current contig / window.
+      } else if (alignDoc) {
+        // Prefer alignment contig name when a FASTA contig aliases to it.
+        const alnMatch = alignDoc.contigs.find(
+          (a) => findContigLength(doc.contigs, a.name) != null,
+        );
+        if (alnMatch) contig = alnMatch.name;
+        else {
+          const shared = contigsShareName(doc.contigs, alignDoc.contigs);
+          if (shared) contig = shared;
+          else if (doc.contigs[0]) contig = doc.contigs[0].name;
+        }
+      } else if (doc.contigs[0]) {
+        contig = doc.contigs[0].name;
+        viewStart = 0;
+        visibleBp = defaultVisibleBp(doc.contigs[0].length);
+      }
+
+      clampWindow();
+      void prefetchAroundViewport(true);
+      const idxNote = doc.fullyCached ? "" : " (indexed)";
+      onLog(
+        `Reference track: ${candidate} — ${doc.contigs.length} contig(s), ${doc.totalBases.toLocaleString()} bases${idxNote}`,
+      );
+      statusMessage = `Reference · ${doc.contigs.length} contig(s) · ${doc.totalBases.toLocaleString()} bases${idxNote}`;
+    } catch (error) {
+      const msg = String(error);
+      errorMessage = msg;
+      statusMessage = "Failed to load reference FASTA.";
+      onLog(`Could not load reference FASTA for Reference track: ${msg}`, "error");
+    }
+  }
+
+  /**
+   * Ensure the dedicated Reference track has sequence data. Prefer an already-open
+   * FASTA; otherwise use the CRAM/reference path or a selected FASTA from the tree.
+   */
+  async function ensureReferenceSequenceLoaded() {
+    if (seqDoc) {
+      void prefetchAroundViewport(true);
+      return;
+    }
+    const candidate = referencePath.trim() || selectedSequencePath || null;
+    if (!candidate) return;
+    await loadReferenceOntoTrack(candidate);
+  }
+
   async function browseReferenceFasta() {
     const picked = await open({
       directory: false,
       multiple: false,
-      title: "Choose reference FASTA for CRAM",
+      title: "Choose reference FASTA",
       filters: [{ name: "FASTA", extensions: ["fasta", "fa", "fna", "fa.gz", "fasta.gz", "fna.gz"] }],
     });
     if (picked) {
+      // Setting referencePath triggers the effect → loadReferenceOntoTrack.
       referencePath = String(picked);
       onLog(`Reference set to ${referencePath}`);
       if (pendingCramPath) void openAlignmentPath(pendingCramPath);
@@ -574,14 +1071,15 @@
   async function openSelected() {
     const seq = selectedSequencePath;
     const anns = selectedAnnotationPaths;
-    const aln = selectedAlignmentPath;
-    if (!seq && anns.length === 0 && !aln) {
+    if (!seq && anns.length === 0 && selectedAlignmentPaths.length === 0) {
       onLog("Select FASTA/FASTQ, GFF/BED, and/or BAM/CRAM first.", "error");
       return;
     }
+    // Open FASTA first so the Reference track is ready before alignments paint.
     if (seq) await openSequencePath(seq);
     for (const path of anns) await openAnnotationPath(path);
-    if (aln) await openAlignmentPath(aln);
+    for (const path of selectedAlignmentPaths) await openAlignmentPath(path);
+    if (!seqDoc) await ensureReferenceSequenceLoaded();
   }
 
   function clearAnnotations() {
@@ -597,15 +1095,8 @@
   }
 
   function clearAlignment() {
-    alignDoc = null;
+    alignTracks = [];
     pendingCramPath = null;
-    coverageBins = [];
-    coverageMax = 0;
-    alignmentReads = [];
-    readsTruncated = false;
-    readsTotal = 0;
-    readCache = null;
-    coverageCache = null;
     selectedRead = null;
     selectedCoverage = null;
   }
@@ -625,6 +1116,31 @@
     };
   }
 
+  /** Desired sequence window: modest pad for snappy pan (not multi-Mb chunks). */
+  function desiredSequenceWindow(): { start: number; end: number } {
+    if (contigLength > 0 && contigLength <= SEQ_PREFETCH_CHUNK_BP) {
+      return { start: 0, end: contigLength };
+    }
+    // Prefer ~viewport + pad, capped — huge ref slices freeze the UI on IPC.
+    const pad = Math.max(
+      Math.min(SEQ_PREFETCH_PAD_BP, 60_000),
+      Math.floor(visibleBp * VIEW_SIDE_PAD_FRACTION),
+    );
+    let start = Math.max(0, viewStart - pad);
+    let end = Math.min(contigLength || viewEnd + pad, viewEnd + pad);
+    const maxSpan = Math.min(
+      MAX_SEQUENCE_WINDOW_BP,
+      Math.max(visibleBp + pad * 2, Math.min(SEQ_PREFETCH_CHUNK_BP, 150_000)),
+    );
+    if (end - start > maxSpan) {
+      const center = viewStart + visibleBp / 2;
+      start = Math.max(0, Math.floor(center - maxSpan / 2));
+      end = Math.min(contigLength || start + maxSpan, start + maxSpan);
+      start = Math.max(0, end - maxSpan);
+    }
+    return { start, end };
+  }
+
   function refreshVisibleSlice() {
     if (!seqDoc || !contig || contigLength <= 0) {
       slice = null;
@@ -637,73 +1153,115 @@
     }
     const local = sliceFromLocalBuffer();
     if (local) {
+      // Keep painting from cache — never blank the track while prefetch runs.
       slice = local;
       maybeSchedulePrefetch();
       return;
     }
+    // Do not start FASTA IPC mid-gesture (uncancelable spawn_blocking).
+    if (viewportBusy()) return;
+    // Viewport not fully covered: fetch expanded window without clearing old paint
+    // unless we have nothing usable at all.
     void fetchExpandedWindow();
   }
 
   function maybeSchedulePrefetch() {
     if (!localBuffer) return;
-    const margin = Math.min(
-      SEQ_PREFETCH_PAD_BP,
-      Math.floor((localBuffer.end - localBuffer.start) * 0.15),
+    if (viewportBusy()) return;
+    const margin = Math.max(
+      Math.floor(visibleBp * VIEW_SIDE_PAD_FRACTION * 0.4),
+      Math.min(SEQ_PREFETCH_PAD_BP, Math.floor((localBuffer.end - localBuffer.start) * 0.2)),
     );
     const nearLeft = viewStart - localBuffer.start < margin;
     const nearRight = localBuffer.end - viewEnd < margin;
     if (nearLeft || nearRight) {
       if (prefetchTimer) clearTimeout(prefetchTimer);
-      prefetchTimer = setTimeout(() => void prefetchAroundViewport(false), 60);
+      prefetchTimer = setTimeout(() => void prefetchAroundViewport(false), 50);
     }
   }
 
   async function prefetchAroundViewport(force: boolean) {
     if (!seqDoc || !contig || contigLength <= 0) return;
     if (visibleBp > MAX_SEQUENCE_WINDOW_BP) return;
-    // Prefer a modest chunk around the viewport so first paint is fast.
-    // Full-contig loads only for small contigs (≤ chunk size).
-    if (contigLength > 0 && contigLength <= SEQ_PREFETCH_CHUNK_BP) {
-      await loadBuffer(0, contigLength, force);
+    // Never fight the UI with IPC while navigating.
+    if (!force && viewportBusy()) return;
+    const { start, end } = desiredSequenceWindow();
+    if (
+      !force &&
+      localBuffer &&
+      localBuffer.contig === contig &&
+      localBuffer.reverseComplement === reverseComplement &&
+      localBuffer.start <= start &&
+      localBuffer.end >= end
+    ) {
       return;
     }
-    let desiredStart = Math.max(0, viewStart - SEQ_PREFETCH_PAD_BP);
-    let desiredEnd = Math.min(contigLength, viewEnd + SEQ_PREFETCH_PAD_BP);
-    if (desiredEnd - desiredStart < SEQ_PREFETCH_CHUNK_BP) {
-      desiredEnd = Math.min(contigLength, desiredStart + SEQ_PREFETCH_CHUNK_BP);
-      desiredStart = Math.max(0, desiredEnd - SEQ_PREFETCH_CHUNK_BP);
-    }
-    if (desiredEnd - desiredStart > MAX_SEQUENCE_WINDOW_BP) {
-      const center = viewStart + visibleBp / 2;
-      const half = Math.floor(MAX_SEQUENCE_WINDOW_BP / 2);
-      desiredStart = Math.max(0, Math.floor(center - half));
-      desiredEnd = Math.min(contigLength, desiredStart + MAX_SEQUENCE_WINDOW_BP);
-    }
-    await loadBuffer(desiredStart, desiredEnd, force);
+    await loadBuffer(start, end, force);
   }
 
   async function fetchExpandedWindow() {
-    // Viewport-first: never block first paint on a multi-megabase full-contig pull.
-    if (contigLength > 0 && contigLength <= SEQ_PREFETCH_CHUNK_BP) {
-      await loadBuffer(0, contigLength, true);
-      return;
-    }
-    const pad = Math.max(SEQ_PREFETCH_PAD_BP, Math.floor(visibleBp * 2));
-    let start = Math.max(0, viewStart - pad);
-    let end = Math.min(contigLength, viewEnd + pad);
-    const target = Math.min(SEQ_PREFETCH_CHUNK_BP, contigLength || SEQ_PREFETCH_CHUNK_BP);
-    if (end - start < target) {
-      end = Math.min(contigLength, start + target);
-      start = Math.max(0, end - target);
-    }
-    if (end - start > MAX_SEQUENCE_WINDOW_BP) end = start + MAX_SEQUENCE_WINDOW_BP;
+    const { start, end } = desiredSequenceWindow();
     await loadBuffer(start, end, true);
+  }
+
+  function mergeSequenceBuffers(
+    prev: LocalBuffer | null,
+    next: LocalBuffer,
+  ): LocalBuffer {
+    if (
+      !prev ||
+      prev.contig !== next.contig ||
+      prev.reverseComplement !== next.reverseComplement
+    ) {
+      return next;
+    }
+    // No overlap / adjacency — prefer the new window (centered on viewport).
+    if (next.end < prev.start || next.start > prev.end) {
+      return next;
+    }
+    const start = Math.min(prev.start, next.start);
+    const end = Math.max(prev.end, next.end);
+    if (end - start > MAX_SEQUENCE_WINDOW_BP) {
+      return next;
+    }
+    // Stitch without gaps (buffers overlap).
+    let sequence = "";
+    for (let p = start; p < end; ) {
+      const inNext = p >= next.start && p < next.end;
+      const inPrev = p >= prev.start && p < prev.end;
+      if (inNext) {
+        const from = p - next.start;
+        const to = Math.min(next.end, end) - next.start;
+        sequence += next.sequence.slice(from, to);
+        p = Math.min(next.end, end);
+      } else if (inPrev) {
+        const from = p - prev.start;
+        const to = Math.min(prev.end, end) - prev.start;
+        sequence += prev.sequence.slice(from, to);
+        p = Math.min(prev.end, end);
+      } else {
+        // Should not happen when intervals merge continuously.
+        break;
+      }
+    }
+    if (sequence.length !== end - start) {
+      return next;
+    }
+    return {
+      contig: next.contig,
+      start,
+      end,
+      sequence,
+      reverseComplement: next.reverseComplement,
+    };
   }
 
   async function loadBuffer(start: number, end: number, updateVisible: boolean) {
     if (!seqDoc || !contig || end <= start) return;
     const token = ++fetchToken;
-    isFetchingSlice = true;
+    // Only surface “fetching…” for visible loads — background prefetch must not
+    // thrash Svelte re-renders of the whole pane (and the rest of the app).
+    if (updateVisible) isFetchingSlice = true;
     try {
       const next = await viewGetSequenceWindow({
         path: seqDoc.path,
@@ -713,34 +1271,39 @@
         reverseComplement,
       });
       if (token !== fetchToken) return;
-      localBuffer = {
+      await yieldToBrowser();
+      if (token !== fetchToken) return;
+      const incoming: LocalBuffer = {
         contig,
         start: next.start,
         end: next.end,
         sequence: next.sequence,
         reverseComplement,
       };
+      localBuffer = mergeSequenceBuffers(localBuffer, incoming);
       if (updateVisible) {
-        slice = sliceFromLocalBuffer() ?? {
-          contig: next.contig,
-          start: viewStart,
-          end: viewEnd,
-          sequence: next.sequence.slice(
-            Math.max(0, viewStart - next.start),
-            Math.max(0, viewEnd - next.start),
-          ),
-          contigLength: next.contigLength,
-          reverseComplemented: next.reverseComplemented,
-        };
+        slice =
+          sliceFromLocalBuffer() ??
+          ({
+            contig: next.contig,
+            start: Math.max(viewStart, next.start),
+            end: Math.min(viewEnd, next.end),
+            sequence: next.sequence.slice(
+              Math.max(0, viewStart - next.start),
+              Math.max(0, viewEnd - next.start),
+            ),
+            contigLength: next.contigLength,
+            reverseComplemented: next.reverseComplemented,
+          } satisfies SequenceSlice);
       }
     } catch (error) {
       if (token !== fetchToken) return;
-      if (updateVisible) {
-        slice = null;
+      // Keep any existing buffer/slice so the track does not blink empty.
+      if (updateVisible && !sliceFromLocalBuffer()) {
         onLog(`Sequence fetch failed: ${String(error)}`, "warn");
       }
     } finally {
-      if (token === fetchToken) isFetchingSlice = false;
+      if (token === fetchToken && updateVisible) isFetchingSlice = false;
     }
   }
 
@@ -754,6 +1317,7 @@
       }));
       return;
     }
+    if (viewportBusy()) return;
     clampWindow();
     const pad = Math.max(visibleBp, 1000);
     const start = Math.max(0, viewStart - pad);
@@ -768,6 +1332,7 @@
             contig,
             start,
             end,
+            featureTypes: featureTypesForFilter(featureTypeFilter),
           }),
         ),
       );
@@ -797,352 +1362,299 @@
     }
   }
 
-  function refreshAlignmentTracksDebounced() {
-    if (alignDebounceTimer) clearTimeout(alignDebounceTimer);
-    // Serve immediately from cache so pan/zoom never waits on IPC.
-    applyAlignmentFromCaches();
-    const filters = readFilterKey({
-      hideSecondary,
-      hideSupplementary,
-      hideDuplicates,
-      minMapq,
-    });
-    const binCount = Math.min(400, Math.max(40, Math.floor(plotWidth / 3)));
-    const readsCovered =
-      !!alignDoc &&
-      cacheCoversWindow(readCache, alignDoc.path, contig, filters, viewStart, viewEnd);
-    const covCovered =
-      !!alignDoc &&
-      coverageCacheCovers(
-        coverageCache,
-        alignDoc.path,
-        contig,
-        viewStart,
-        viewEnd,
-        binCount,
-      );
-    const fullyCovered = (!showReadPileup || readsCovered || visibleBp > READ_FETCH_MAX_BP) &&
-      (!showCoverage || covCovered);
-    const delay = fullyCovered
-      ? isPanning || isOverviewDragging
-        ? FETCH_DEBOUNCE_PAN_MS
-        : FETCH_DEBOUNCE_IDLE_MS
-      : isPanning || isOverviewDragging
-        ? FETCH_DEBOUNCE_PAN_MS
-        : visibleBp <= 80_000
-          ? 40
-          : 90;
-    alignDebounceTimer = setTimeout(() => void refreshAlignmentTracks(), delay);
+  function alignmentFilterKey(includeSequences: boolean): string {
+    return (
+      readFilterKey({
+        hideSecondary,
+        hideSupplementary,
+        hideDuplicates,
+        minMapq,
+      }) + (includeSequences ? "|seq" : "|noseq")
+    );
   }
 
-  /** Instantly slice cached coverage/reads into the viewport (no IPC). */
-  function applyAlignmentFromCaches() {
-    if (!alignDoc || !contig) return;
-    const filters = readFilterKey({
-      hideSecondary,
-      hideSupplementary,
-      hideDuplicates,
+  function filterOpts() {
+    return {
+      includeSecondary: !hideSecondary,
+      includeSupplementary: !hideSupplementary,
+      includeDuplicates: !hideDuplicates,
       minMapq,
-    });
-    const binCount = Math.min(400, Math.max(40, Math.floor(plotWidth / 3)));
+    };
+  }
 
-    if (
-      showCoverage &&
-      coverageCacheCovers(
-        coverageCache,
-        alignDoc.path,
-        contig,
-        viewStart,
-        viewEnd,
-        binCount,
-      ) &&
-      coverageCache
-    ) {
-      coverageBins = coverageCache.bins.filter(
-        (b) => b.end > viewStart && b.start < viewEnd,
-      );
-      coverageMax = coverageCache.maxDepth;
-    }
+  function trackNeedsNetwork(t: AlignTrackState, needSeq: boolean, filters: string): boolean {
+    const wantReads = showReadPileup && visibleBp <= READ_FETCH_MAX_BP;
+    const readsHit =
+      !wantReads ||
+      readCacheUsable(t.readCache, t.path, contig, filters, viewStart, viewEnd, needSeq);
+    const covHit =
+      !showCoverage ||
+      (coverageCacheCovers(t.coverageCache, t.path, contig, viewStart, viewEnd) &&
+        coverageCacheDenseEnough(t.coverageCache, viewStart, viewEnd, plotWidth) &&
+        !(t.coverageCache && coverageNearEdge(t.coverageCache, viewStart, viewEnd, visibleBp)));
+    return (showCoverage && !covHit) || (wantReads && !readsHit);
+  }
 
-    if (
-      showReadPileup &&
-      visibleBp <= READ_FETCH_MAX_BP &&
-      cacheCoversWindow(readCache, alignDoc.path, contig, filters, viewStart, viewEnd) &&
-      readCache
-    ) {
-      alignmentReads = readsOverlapWindow(readCache.reads, viewStart, viewEnd);
-      readsTruncated = readCache.truncated;
-      readsTotal = readCache.totalInRange;
+  function refreshAlignmentTracksDebounced() {
+    if (alignDebounceTimer) clearTimeout(alignDebounceTimer);
+    applyAlignmentFromCaches();
+    schedulePaint();
+    if (viewportBusy()) return;
+
+    const needSeq = visibleBp <= READ_SEQUENCES_MAX_BP;
+    const filters = alignmentFilterKey(needSeq);
+    const needsWork = alignTracks.some((t) => trackNeedsNetwork(t, needSeq, filters));
+    if (!needsWork && alignTracks.every((t) => t.overviewBins.length > 0)) return;
+    alignDebounceTimer = setTimeout(() => void refreshAlignmentTracks(), FETCH_DEBOUNCE_IDLE_MS);
+  }
+
+  function applyTrackFromCaches(t: AlignTrackState, needSeq: boolean, filters: string): AlignTrackState {
+    const wantReads = showReadPileup && visibleBp <= READ_FETCH_MAX_BP;
+    let next = t;
+    if (showCoverage && t.coverageCache && coverageCacheCovers(t.coverageCache, t.path, contig, viewStart, viewEnd)) {
+      const bins = t.coverageCache.bins.filter((b) => b.end > viewStart && b.start < viewEnd);
+      next = {
+        ...next,
+        coverageBins: bins,
+        coverageMax: maxDepthInView(bins, viewStart, viewEnd),
+      };
     }
+    if (!wantReads) {
+      return {
+        ...next,
+        alignmentReads: [],
+        readsTruncated: false,
+        readsTotal: 0,
+      };
+    }
+    if (t.readCache && readCacheCanDisplay(t.readCache, t.path, contig, filters, viewStart, viewEnd)) {
+      const overlap = readsOverlapWindow(t.readCache.reads, viewStart, viewEnd);
+      next = {
+        ...next,
+        alignmentReads: overlap,
+        readsTruncated: t.readCache.truncated,
+        readsTotal: Math.max(t.readCache.totalInRange, overlap.length),
+      };
+    }
+    return next;
+  }
+
+  function applyAlignmentFromCaches() {
+    if (alignTracks.length === 0 || !contig) return;
+    const needSeq = visibleBp <= READ_SEQUENCES_MAX_BP;
+    const filters = alignmentFilterKey(needSeq);
+    alignTracks = alignTracks.map((t) => applyTrackFromCaches(t, needSeq, filters));
+    if (!viewportBusy()) recomputeReadPack();
   }
 
   async function refreshAlignmentTracks() {
-    if (!alignDoc || !contig || contigLength <= 0) {
-      coverageBins = [];
-      coverageMax = 0;
-      alignmentReads = [];
-      readsTotal = 0;
+    if (alignTracks.length === 0 || !contig || contigLength <= 0) {
       return;
     }
+    if (viewportBusy()) {
+      applyAlignmentFromCaches();
+      return;
+    }
+    if (isFetchingAlign) {
+      alignFetchNeedsRerun = true;
+      return;
+    }
+
     clampWindow();
     const token = ++alignFetchToken;
-    const ref =
-      alignDoc.requiresReference && referencePath.trim() ? referencePath.trim() : null;
-    const filters = readFilterKey({
-      hideSecondary,
-      hideSupplementary,
-      hideDuplicates,
-      minMapq,
-    });
-    const binCount = Math.min(400, Math.max(40, Math.floor(plotWidth / 3)));
+    const includeSequences = visibleBp <= READ_SEQUENCES_MAX_BP;
+    const filters = alignmentFilterKey(includeSequences);
+    const covPlan = coveragePlanForView();
+    const wantReads = showReadPileup && visibleBp <= READ_FETCH_MAX_BP;
+    const opts = filterOpts();
 
     try {
-      const wantReads = showReadPileup && visibleBp <= READ_FETCH_MAX_BP;
-      const includeSequences = visibleBp <= BASE_LETTERS_MAX_BP;
-      const readsHit =
-        wantReads &&
-        cacheCoversWindow(readCache, alignDoc.path, contig, filters, viewStart, viewEnd);
-      const covHit =
-        showCoverage &&
-        coverageCacheCovers(
-          coverageCache,
-          alignDoc.path,
-          contig,
-          viewStart,
-          viewEnd,
-          binCount,
-        );
-
-      // Apply any existing cache first so UI stays live while network runs.
       applyAlignmentFromCaches();
+      const work = alignTracks.filter((t) => trackNeedsNetwork(t, includeSequences, filters) || t.overviewBins.length === 0);
+      if (work.length === 0) return;
 
-      const needsNetwork = (showCoverage && !covHit) || (wantReads && !readsHit);
-      if (needsNetwork) isFetchingAlign = true;
+      isFetchingAlign = true;
+      const updated = [...alignTracks];
 
-      let covPromise: ReturnType<typeof viewGetCoverageBins> | null = null;
-      let covFetchStart = 0;
-      let covFetchEnd = 0;
-      if (showCoverage && !covHit) {
-        ({ start: covFetchStart, end: covFetchEnd } = computeCoverageFetchWindow(
-          viewStart,
-          viewEnd,
-          contigLength,
-          visibleBp,
-        ));
-        covPromise = viewGetCoverageBins({
-          path: alignDoc.path,
-          contig,
-          start: covFetchStart,
-          end: covFetchEnd,
-          binCount,
-          referencePath: ref,
-        });
-      }
+      await Promise.all(
+        work.map(async (t) => {
+          const idx = updated.findIndex((x) => x.path === t.path);
+          if (idx < 0) return;
+          const ref =
+            t.doc.requiresReference && referencePath.trim() ? referencePath.trim() : null;
+          const readsHit = !wantReads || readCacheUsable(t.readCache, t.path, contig, filters, viewStart, viewEnd, includeSequences);
+          const covHit =
+            showCoverage &&
+            coverageCacheCovers(t.coverageCache, t.path, contig, viewStart, viewEnd) &&
+            coverageCacheDenseEnough(t.coverageCache, viewStart, viewEnd, plotWidth);
 
-      let readPromise: ReturnType<typeof viewGetReadsInRange> | null = null;
-      let fetchStart = 0;
-      let fetchEnd = 0;
-      if (wantReads && !readsHit) {
-        ({ start: fetchStart, end: fetchEnd } = computeReadFetchWindow(
-          viewStart,
-          viewEnd,
-          contigLength,
-          visibleBp,
-        ));
-        readPromise = viewGetReadsInRange({
-          path: alignDoc.path,
-          contig,
-          start: fetchStart,
-          end: fetchEnd,
-          referencePath: ref,
-          includeSecondary: !hideSecondary,
-          includeSupplementary: !hideSupplementary,
-          includeDuplicates: !hideDuplicates,
-          minMapq,
-          includeSequences,
-        });
-      }
+          try {
+            if (showCoverage && wantReads && !readsHit) {
+              const readWin = computeReadFetchWindow(viewStart, viewEnd, contigLength, visibleBp);
+              const win = await viewGetAlignmentWindow({
+                path: t.path,
+                contig,
+                start: Math.min(covPlan.start, readWin.start),
+                end: Math.max(covPlan.end, readWin.end),
+                binCount: covPlan.binCount,
+                referencePath: ref,
+                ...opts,
+                includeSequences,
+                includeReads: true,
+              });
+              if (token !== alignFetchToken) return;
+              const covCache: CoverageCache = {
+                path: t.path,
+                contig,
+                start: covPlan.start,
+                end: covPlan.end,
+                binCount: covPlan.binCount,
+                bins: win.coverage.bins,
+                maxDepth: win.coverage.maxDepth,
+              };
+              const bins = win.coverage.bins.filter((b) => b.end > viewStart && b.start < viewEnd);
+              updated[idx] = {
+                ...updated[idx]!,
+                coverageCache: covCache,
+                coverageBins: bins,
+                coverageMax: maxDepthInView(bins, viewStart, viewEnd),
+                readCache: {
+                  path: t.path,
+                  contig,
+                  start: readWin.start,
+                  end: readWin.end,
+                  filterKey: filters,
+                  reads: win.reads.reads,
+                  totalInRange: win.reads.totalInRange,
+                  truncated: win.reads.truncated,
+                  hasSequences: includeSequences,
+                },
+                alignmentReads: readsOverlapWindow(win.reads.reads, viewStart, viewEnd),
+                readsTruncated: win.reads.truncated,
+                readsTotal: win.reads.totalInRange,
+              };
+            } else {
+              if (showCoverage && !covHit) {
+                const cov = await viewGetCoverageBins({
+                  path: t.path,
+                  contig,
+                  start: covPlan.start,
+                  end: covPlan.end,
+                  binCount: covPlan.binCount,
+                  referencePath: ref,
+                  ...opts,
+                });
+                if (token !== alignFetchToken) return;
+                const bins = cov.bins.filter((b) => b.end > viewStart && b.start < viewEnd);
+                updated[idx] = {
+                  ...updated[idx]!,
+                  coverageCache: {
+                    path: t.path,
+                    contig,
+                    start: covPlan.start,
+                    end: covPlan.end,
+                    binCount: covPlan.binCount,
+                    bins: cov.bins,
+                    maxDepth: cov.maxDepth,
+                  },
+                  coverageBins: bins,
+                  coverageMax: maxDepthInView(bins, viewStart, viewEnd),
+                };
+              }
+              if (wantReads && !readsHit) {
+                const readWin = computeReadFetchWindow(viewStart, viewEnd, contigLength, visibleBp);
+                const reads = await viewGetReadsInRange({
+                  path: t.path,
+                  contig,
+                  start: readWin.start,
+                  end: readWin.end,
+                  referencePath: ref,
+                  ...opts,
+                  includeSequences,
+                });
+                if (token !== alignFetchToken) return;
+                const cur = updated[idx]!;
+                updated[idx] = {
+                  ...cur,
+                  readCache: {
+                    path: t.path,
+                    contig,
+                    start: readWin.start,
+                    end: readWin.end,
+                    filterKey: filters,
+                    reads: reads.reads,
+                    totalInRange: reads.totalInRange,
+                    truncated: reads.truncated,
+                    hasSequences: includeSequences,
+                  },
+                  alignmentReads: readsOverlapWindow(reads.reads, viewStart, viewEnd),
+                  readsTruncated: reads.truncated,
+                  readsTotal: reads.totalInRange,
+                };
+              }
+            }
 
-      const [cov, reads] = await Promise.all([covPromise, readPromise]);
+            const cur = updated[idx]!;
+            if (cur.overviewBins.length === 0 && contigLength > 0) {
+              try {
+                const ov = await viewGetOverviewCoverage({
+                  path: t.path,
+                  contig,
+                  contigLength,
+                  binCount: OVERVIEW_BINS,
+                  referencePath: ref,
+                  ...opts,
+                });
+                if (token !== alignFetchToken) return;
+                updated[idx] = {
+                  ...updated[idx]!,
+                  overviewBins: ov.bins,
+                  overviewMax: ov.maxDepth,
+                };
+              } catch {
+                /* non-fatal */
+              }
+            }
+          } catch (error) {
+            if (token !== alignFetchToken) return;
+            onLog(`Alignment track failed (${t.label}): ${String(error)}`, "warn");
+          }
+        }),
+      );
+
       if (token !== alignFetchToken) return;
-
-      if (showCoverage) {
-        if (cov) {
-          coverageCache = {
-            path: alignDoc.path,
-            contig,
-            start: covFetchStart,
-            end: covFetchEnd,
-            binCount,
-            bins: cov.bins,
-            maxDepth: cov.maxDepth,
-          };
-          coverageBins = cov.bins.filter((b) => b.end > viewStart && b.start < viewEnd);
-          coverageMax = cov.maxDepth;
-          if (selectedCoverage) {
-            const still = cov.bins.find(
-              (b) => b.start === selectedCoverage!.start && b.end === selectedCoverage!.end,
-            );
-            selectedCoverage = still ?? null;
-          }
-        } else if (covHit && coverageCache) {
-          coverageBins = coverageCache.bins.filter(
-            (b) => b.end > viewStart && b.start < viewEnd,
-          );
-          coverageMax = coverageCache.maxDepth;
-          if (coverageNearEdge(coverageCache, viewStart, viewEnd, visibleBp)) {
-            void expandCoverageCache(ref, binCount, token);
-          }
-        }
-      } else {
-        coverageBins = [];
-        coverageMax = 0;
-        selectedCoverage = null;
-      }
-
-      if (wantReads) {
-        if (readsHit && readCache) {
-          alignmentReads = readsOverlapWindow(readCache.reads, viewStart, viewEnd);
-          readsTruncated = readCache.truncated;
-          readsTotal = readCache.totalInRange;
-          if (cacheNearEdge(readCache, viewStart, viewEnd, visibleBp)) {
-            void expandReadCache(ref, filters, token);
-          }
-        } else if (reads) {
-          readCache = {
-            path: alignDoc.path,
-            contig,
-            start: fetchStart,
-            end: fetchEnd,
-            filterKey: filters,
-            reads: reads.reads,
-            totalInRange: reads.totalInRange,
-            truncated: reads.truncated,
-          };
-          alignmentReads = readsOverlapWindow(reads.reads, viewStart, viewEnd);
-          readsTruncated = reads.truncated;
-          readsTotal = reads.totalInRange;
-        }
-
-        if (selectedRead) {
-          const still = alignmentReads.find(
+      await yieldToBrowser();
+      if (token !== alignFetchToken) return;
+      alignTracks = updated;
+      if (selectedRead) {
+        const still = alignTracks
+          .flatMap((t) => t.alignmentReads)
+          .find(
             (r) =>
               r.name === selectedRead!.name &&
               r.start === selectedRead!.start &&
               r.flags === selectedRead!.flags,
           );
-          selectedRead = still ?? null;
-        }
-      } else {
-        alignmentReads = [];
-        readsTruncated = false;
-        readsTotal = 0;
-        if (visibleBp > READ_FETCH_MAX_BP) selectedRead = null;
+        selectedRead = still ?? null;
       }
+      recomputeReadPack();
     } catch (error) {
       if (token !== alignFetchToken) return;
       onLog(`Alignment track failed: ${String(error)}`, "warn");
     } finally {
-      if (token === alignFetchToken) isFetchingAlign = false;
+      if (token === alignFetchToken) {
+        isFetchingAlign = false;
+        applyAlignmentFromCaches();
+        schedulePaint();
+        if (alignFetchNeedsRerun) {
+          alignFetchNeedsRerun = false;
+          if (!viewportBusy()) void refreshAlignmentTracks();
+          else alignFetchNeedsRerun = true;
+        }
+      }
     }
   }
 
-  async function expandCoverageCache(
-    ref: string | null,
-    binCount: number,
-    token: number,
-  ) {
-    if (!alignDoc || !contig || contigLength <= 0) return;
-    const { start: fetchStart, end: fetchEnd } = computeCoverageFetchWindow(
-      viewStart,
-      viewEnd,
-      contigLength,
-      visibleBp,
-    );
-    if (
-      coverageCache &&
-      coverageCache.path === alignDoc.path &&
-      coverageCache.contig === contig &&
-      fetchStart >= coverageCache.start &&
-      fetchEnd <= coverageCache.end
-    ) {
-      return;
-    }
-    try {
-      const cov = await viewGetCoverageBins({
-        path: alignDoc.path,
-        contig,
-        start: fetchStart,
-        end: fetchEnd,
-        binCount,
-        referencePath: ref,
-      });
-      if (token !== alignFetchToken) return;
-      coverageCache = {
-        path: alignDoc.path,
-        contig,
-        start: fetchStart,
-        end: fetchEnd,
-        binCount,
-        bins: cov.bins,
-        maxDepth: cov.maxDepth,
-      };
-      coverageBins = cov.bins.filter((b) => b.end > viewStart && b.start < viewEnd);
-      coverageMax = cov.maxDepth;
-    } catch {
-      /* non-fatal */
-    }
-  }
-
-  async function expandReadCache(ref: string | null, filters: string, token: number) {
-    if (!alignDoc || !contig || contigLength <= 0) return;
-    const { start: fetchStart, end: fetchEnd } = computeReadFetchWindow(
-      viewStart,
-      viewEnd,
-      contigLength,
-      visibleBp,
-    );
-    if (
-      readCache &&
-      readCache.path === alignDoc.path &&
-      readCache.contig === contig &&
-      readCache.filterKey === filters &&
-      fetchStart >= readCache.start &&
-      fetchEnd <= readCache.end
-    ) {
-      return;
-    }
-    try {
-      const reads = await viewGetReadsInRange({
-        path: alignDoc.path,
-        contig,
-        start: fetchStart,
-        end: fetchEnd,
-        referencePath: ref,
-        includeSecondary: !hideSecondary,
-        includeSupplementary: !hideSupplementary,
-        includeDuplicates: !hideDuplicates,
-        minMapq,
-        includeSequences: visibleBp <= BASE_LETTERS_MAX_BP,
-      });
-      if (token !== alignFetchToken) return;
-      readCache = {
-        path: alignDoc.path,
-        contig,
-        start: fetchStart,
-        end: fetchEnd,
-        filterKey: filters,
-        reads: reads.reads,
-        totalInRange: reads.totalInRange,
-        truncated: reads.truncated,
-      };
-      alignmentReads = readsOverlapWindow(reads.reads, viewStart, viewEnd);
-      readsTruncated = reads.truncated;
-      readsTotal = reads.totalInRange;
-    } catch {
-      /* non-fatal */
-    }
-  }
 
   function selectRead(read: AlignmentRead) {
     selectedRead = read;
@@ -1217,6 +1729,8 @@
     clampWindow();
     viewStart = Math.round(center - t * visibleBp);
     clampWindow();
+    // Wheel/button zoom is not isPanning — still must suppress IPC until idle.
+    markNavigating();
   }
 
   function applyLocusFromInput() {
@@ -1227,8 +1741,11 @@
       return;
     }
     if (parsed.contig !== contig) {
-      const known = contigOptions.some((c) => c.name === parsed.contig);
-      if (known) contig = parsed.contig;
+      const resolved = resolveContigName(
+        contigOptions.map((c) => c.name),
+        parsed.contig,
+      );
+      if (resolved) contig = resolved;
       else {
         onLog(`Unknown contig: ${parsed.contig}`, "warn");
         return;
@@ -1240,7 +1757,7 @@
     locusInput = formatLocus(contig, viewStart, viewEnd);
   }
 
-  function overviewCenterAt(clientX: number, el: HTMLElement) {
+  function overviewCenterAt(clientX: number, el: HTMLElement, coalesce = false) {
     if (contigLength <= 0) return;
     const layout = viewerLayout;
     const rect = el.getBoundingClientRect();
@@ -1248,8 +1765,10 @@
     const usable = Math.max(1, layout.usable);
     const t = Math.max(0, Math.min(1, (x - layout.padL) / usable));
     const center = Math.floor(t * contigLength);
-    viewStart = Math.max(0, Math.min(contigLength - visibleBp, center - Math.floor(visibleBp / 2)));
-    clampWindow();
+    setViewStart(
+      Math.max(0, Math.min(contigLength - visibleBp, center - Math.floor(visibleBp / 2))),
+      coalesce,
+    );
   }
 
   function onViewerKeydown(event: KeyboardEvent) {
@@ -1260,20 +1779,23 @@
     }
     if (event.key === "+" || event.key === "=") {
       event.preventDefault();
-      zoomInCenter();
+      zoomInCenter(); // markNavigating via zoomAtClientX
     } else if (event.key === "-" || event.key === "_") {
       event.preventDefault();
       zoomOutCenter();
     } else if (event.key === "ArrowLeft") {
       event.preventDefault();
       const step = Math.max(1, Math.floor(visibleBp * KEY_PAN_FRACTION));
-      viewStart = Math.max(0, viewStart - step);
-      clampWindow();
+      setViewStart(Math.max(0, (pendingViewStart ?? viewStart) - step), true);
+      markNavigating();
     } else if (event.key === "ArrowRight") {
       event.preventDefault();
       const step = Math.max(1, Math.floor(visibleBp * KEY_PAN_FRACTION));
-      viewStart = Math.min(Math.max(0, contigLength - visibleBp), viewStart + step);
-      clampWindow();
+      setViewStart(
+        Math.min(Math.max(0, contigLength - visibleBp), (pendingViewStart ?? viewStart) + step),
+        true,
+      );
+      markNavigating();
     } else if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c") {
       if (selectionStart != null && selectionEnd != null) {
         event.preventDefault();
@@ -1286,8 +1808,11 @@
     contig = name;
     viewStart = 0;
     const len =
-      seqDoc?.contigs.find((c) => c.name === name)?.length ??
-      alignDoc?.contigs.find((c) => c.name === name)?.length ??
+      findContigLength(seqDoc?.contigs, name) ??
+      findContigLength(
+        alignTracks.flatMap((t) => t.doc.contigs),
+        name,
+      ) ??
       0;
     visibleBp = Math.min(Math.max(MIN_VISIBLE_BP, Math.min(visibleBp, len || MIN_VISIBLE_BP)), len || MIN_VISIBLE_BP);
     selectionStart = null;
@@ -1295,22 +1820,34 @@
     selectedFeature = null;
     selectedRead = null;
     localBuffer = null;
-    readCache = null;
-    coverageCache = null;
+    alignTracks = alignTracks.map((t) => ({
+      ...t,
+      readCache: null,
+      coverageCache: null,
+      overviewBins: [],
+      overviewMax: 0,
+      alignmentReads: [],
+      coverageBins: [],
+      coverageMax: 0,
+      readPack: emptyPack(),
+    }));
     clampWindow();
     if (seqDoc) void prefetchAroundViewport(true);
   }
 
   function coverageAtClient(clientX: number, clientY: number): CoverageBin | null {
-    if (!canvasEl || !showCovTrack || coverageBins.length === 0 || visibleBp <= 0) return null;
+    if (!canvasEl || !showCovTrack || visibleBp <= 0) return null;
     const rect = canvasEl.getBoundingClientRect();
     const y = clientY - rect.top;
     const layout = viewerLayout;
-    if (!layout.cov || y < layout.cov.top || y > layout.cov.top + layout.cov.height) return null;
     const g = genomicFromClientX(clientX, canvasEl, viewStart, visibleBp, PAD_L, PAD_R);
     if (g == null) return null;
-    for (const bin of coverageBins) {
-      if (g >= bin.start && g < bin.end) return bin;
+    for (const band of layout.covTracks) {
+      if (y < band.top || y > band.top + band.height) continue;
+      const track = alignTracks.find((t) => t.path === band.path);
+      for (const bin of track?.coverageBins ?? []) {
+        if (g >= bin.start && g < bin.end) return bin;
+      }
     }
     return null;
   }
@@ -1338,24 +1875,40 @@
   }
 
   function readAtClient(clientX: number, clientY: number): AlignmentRead | null {
-    if (!readsCanvasEl || !showReadsTrack || readPack.packed.length === 0) return null;
+    if (!readsCanvasEl || !showReadsTrack) return null;
     const rect = readsCanvasEl.getBoundingClientRect();
     const y = clientY - rect.top;
     const g = genomicFromClientX(clientX, readsCanvasEl, viewStart, visibleBp, PAD_L, PAD_R);
     if (g == null) return null;
-    const headerH = 20;
-    const lane = Math.floor((y - headerH - 3) / READ_LANE_H);
-    if (lane < 0 || lane >= readPack.packed.length) return null;
-    const item = readPack.packed[lane];
-    if (!item) return null;
-    if (g >= item.read.start && g < item.read.end) return item.read;
+    const layout = viewerLayout;
+    for (const band of layout.readsTracks) {
+      if (band.collapsed || band.densityOnly) continue;
+      if (y < band.top || y >= band.top + band.height) continue;
+      const lane = Math.floor((y - band.top - band.headerH - 2) / READ_LANE_H);
+      if (lane < 0) return null;
+      const track = alignTracks.find((t) => t.path === band.path);
+      const hits = (track?.readPack.packed ?? []).filter(
+        (p) => p.lane === lane && g >= p.read.start && g < p.read.end,
+      );
+      if (hits.length === 0) return null;
+      hits.sort((a, b) => a.read.end - a.read.start - (b.read.end - b.read.start));
+      return hits[0]!.read;
+    }
     return null;
   }
 
   function onCanvasPointerDown(event: PointerEvent) {
     if (!hasDocument) return;
     const target = event.currentTarget as HTMLCanvasElement;
-    target.setPointerCapture(event.pointerId);
+    // Always track capture so window-level safety can release it.
+    try {
+      target.setPointerCapture(event.pointerId);
+      capturedPointerId = event.pointerId;
+      captureTarget = target;
+    } catch {
+      capturedPointerId = null;
+      captureTarget = null;
+    }
     wrapEl?.focus();
 
     if (target === canvasEl && hitOverview(event.clientY, target, viewerLayout)) {
@@ -1376,6 +1929,8 @@
       if (hitRead && !event.shiftKey) {
         selectRead(hitRead);
         dragOrigin = null;
+        // Click-select only — release capture so the shell stays interactive.
+        releaseCanvasPointerCapture();
         return;
       }
     }
@@ -1400,7 +1955,10 @@
     }
 
     const g = genomicFromClientX(event.clientX, target, viewStart, visibleBp, PAD_L, PAD_R);
-    if (g == null) return;
+    if (g == null) {
+      releaseCanvasPointerCapture();
+      return;
+    }
     selectedFeature = null;
     selectedRead = null;
     selectedCoverage = null;
@@ -1412,15 +1970,15 @@
   function onCanvasPointerMove(event: PointerEvent) {
     const target = event.currentTarget as HTMLCanvasElement;
     if (isOverviewDragging && target === canvasEl) {
-      overviewCenterAt(event.clientX, target);
+      overviewCenterAt(event.clientX, target, true);
       return;
     }
     if (isPanning) {
       const layout = viewerLayout;
       const usable = Math.max(1, layout.usable);
       const dx = event.clientX - panOriginX;
-      viewStart = panOriginStart + Math.round((-dx / usable) * visibleBp);
-      clampWindow();
+      // One viewStart commit per animation frame — keeps explorer/menus responsive.
+      setViewStart(panOriginStart + Math.round((-dx / usable) * visibleBp), true);
       return;
     }
     if (dragOrigin == null) return;
@@ -1430,14 +1988,18 @@
     selectionEnd = Math.max(dragOrigin, g) + 1;
   }
 
-  function onCanvasPointerUp(event: PointerEvent) {
-    const target = event.currentTarget as HTMLCanvasElement;
-    if (target.hasPointerCapture(event.pointerId)) target.releasePointerCapture(event.pointerId);
-    const wasPanning = isPanning || isOverviewDragging;
-    isPanning = false;
-    isOverviewDragging = false;
-    dragOrigin = null;
-    if (wasPanning) refreshAlignmentTracksDebounced();
+  function onCanvasPointerUp(_event: PointerEvent) {
+    endCanvasGesture();
+  }
+
+  function onCanvasLostPointerCapture() {
+    if (releasingCapture) return;
+    // Browser revoked capture (e.g. alert, OS gesture) — clear stuck pan state.
+    capturedPointerId = null;
+    captureTarget = null;
+    if (isPanning || isOverviewDragging || dragOrigin != null) {
+      endCanvasGesture({ fromWindow: true });
+    }
   }
 
   function onCanvasDoubleClick(event: MouseEvent) {
@@ -1454,15 +2016,73 @@
     zoomAtClientX(event.clientX, ZOOM_IN_FACTOR);
   }
 
-  function onCanvasWheel(event: WheelEvent) {
+  /** Normalize wheel delta to a rough pixel-like magnitude. */
+  function wheelPixels(event: WheelEvent): number {
+    if (event.deltaMode === 1) return event.deltaY * 16; // lines
+    if (event.deltaMode === 2) return event.deltaY * 120; // pages
+    return event.deltaY;
+  }
+
+  /** Horizontal pan: scroll down / right → move view toward higher coordinates (IGV-like). */
+  function panByWheel(event: WheelEvent) {
+    if (contigLength <= 0 || visibleBp <= 0) return;
+    const px = wheelPixels(event);
+    // Also honor horizontal trackpad swipes.
+    const hPx = event.deltaMode === 0 ? event.deltaX : 0;
+    const primary = Math.abs(hPx) > Math.abs(px) ? hPx : px;
+    if (primary === 0) return;
+    const fraction = Math.min(0.4, Math.abs(primary) / 280);
+    const step = Math.max(1, Math.round(visibleBp * fraction * 0.85));
+    const base = pendingViewStart ?? viewStart;
+    setViewStart(base + (primary > 0 ? step : -step), true);
+    // Wheel pan never set isPanning — suppress BAM/CRAM IPC until gesture ends.
+    markNavigating();
+  }
+
+  /**
+   * Fixed tracks (coverage, ref, features, ruler):
+   *   wheel       → pan left/right
+   *   Ctrl/⌘+wheel → zoom at pointer
+   * Alignments track uses {@link onReadsWheel} (vertical scroll of pileup).
+   */
+  function onFixedTracksWheel(event: WheelEvent) {
     event.preventDefault();
-    if (event.shiftKey) {
-      const step = Math.max(1, Math.floor(visibleBp * 0.08));
-      viewStart += event.deltaY > 0 ? step : -step;
-      clampWindow();
+    if (event.ctrlKey || event.metaKey) {
+      zoomAtClientX(event.clientX, wheelPixels(event) > 0 ? ZOOM_OUT_FACTOR : ZOOM_IN_FACTOR);
       return;
     }
-    zoomAtClientX(event.clientX, event.deltaY > 0 ? ZOOM_OUT_FACTOR : ZOOM_IN_FACTOR);
+    panByWheel(event);
+  }
+
+  /**
+   * Alignments pileup:
+   *   wheel       → scroll the read list vertically
+   *   Ctrl/⌘+wheel → zoom at pointer (same as coverage)
+   *   Shift+wheel → pan left/right without leaving the track
+   */
+  function onReadsWheel(event: WheelEvent) {
+    if (event.ctrlKey || event.metaKey) {
+      event.preventDefault();
+      zoomAtClientX(event.clientX, wheelPixels(event) > 0 ? ZOOM_OUT_FACTOR : ZOOM_IN_FACTOR);
+      return;
+    }
+    if (event.shiftKey) {
+      event.preventDefault();
+      panByWheel(event);
+      return;
+    }
+    // Canvas sits inside `.reads-scroll` — drive vertical scroll explicitly so
+    // the pileup always moves (browser default is unreliable over <canvas>).
+    const scrollEl = (event.currentTarget as HTMLElement | null)?.closest(
+      ".reads-scroll",
+    ) as HTMLElement | null;
+    if (!scrollEl) return;
+    const px = wheelPixels(event);
+    if (px === 0) return;
+    const maxScroll = scrollEl.scrollHeight - scrollEl.clientHeight;
+    if (maxScroll <= 0) return;
+    event.preventDefault();
+    scrollEl.scrollTop = Math.max(0, Math.min(maxScroll, scrollEl.scrollTop + px));
   }
 
   async function copySelection() {
@@ -1574,12 +2194,22 @@
           <div class="pop-menu">
             {#if seqDoc}
               <label class="pop-check"><input type="checkbox" bind:checked={reverseComplement} /> Rev-comp reference</label>
-              <label class="pop-check"><input type="checkbox" bind:checked={colorBases} /> Color bases</label>
+              <label class="pop-check"><input type="checkbox" bind:checked={colorBases} /> Letters on mismatch bases (reads)</label>
             {/if}
             {#if alignDoc}
-              <label class="pop-check"><input type="checkbox" bind:checked={colorMismatches} /> Color mismatches in coverage</label>
+              <label class="pop-check"><input type="checkbox" bind:checked={colorMismatches} /> Mismatch &amp; indel highlights</label>
             {/if}
+            <p class="pop-hint">Use ▾ / ▸ in the track gutter to collapse or expand tracks. Coverage is depth (grey) only.</p>
             {#if annDocs.length > 0}
+              <label class="pop-field">
+                <span>Features</span>
+                <select bind:value={featureTypeFilter}>
+                  <option value="genes">Genes / transcripts</option>
+                  <option value="exons">Exons / UTRs</option>
+                  <option value="cds">CDS only</option>
+                  <option value="all">All types</option>
+                </select>
+              </label>
               <div class="pop-sep"></div>
               <button type="button" class="pop-item" onclick={() => { clearAnnotations(); closeMenus(); }}>Clear annotations</button>
             {/if}
@@ -1607,8 +2237,8 @@
               <label class="pop-field">
                 <span>Color reads</span>
                 <select bind:value={colorReadsBy}>
-                  <option value="strand">Strand</option>
                   <option value="none">Gray</option>
+                  <option value="strand">Strand</option>
                   <option value="mapq">MAPQ</option>
                   <option value="pair">Pair</option>
                 </select>
@@ -1651,26 +2281,47 @@
       <div class="viewer-main">
         <div class="track-gutter" style:width="{GUTTER_WIDTH}px">
           {#each viewerLayout.bands as band (band.id)}
-            {#if band.id !== "reads"}
-              <div class="gutter-row" style:height="{band.height}px" title={band.label}>
+            {#if !String(band.id).startsWith("reads")}
+              <div
+                class="gutter-row"
+                class:collapsed={band.collapsed}
+                style:height="{band.height}px"
+                title={band.label}
+              >
                 {#if band.id === "seq"}
-                  <label class="gutter-check">
-                    <input type="checkbox" bind:checked={showSeqTrackVisible} disabled={!seqDoc} />
-                  </label>
-                {:else if band.id === "cov"}
-                  <label class="gutter-check">
-                    <input type="checkbox" bind:checked={showCoverage} disabled={!alignDoc} />
-                  </label>
+                  <button
+                    type="button"
+                    class="gutter-collapse"
+                    class:collapsed={!showSeqTrackVisible}
+                    title={showSeqTrackVisible ? "Collapse reference" : "Expand reference"}
+                    aria-label={showSeqTrackVisible ? "Collapse reference" : "Expand reference"}
+                    aria-expanded={showSeqTrackVisible}
+                    onclick={() => (showSeqTrackVisible = !showSeqTrackVisible)}
+                  >{showSeqTrackVisible ? "▾" : "▸"}</button>
+                {:else if String(band.id).startsWith("cov")}
+                  <button
+                    type="button"
+                    class="gutter-collapse"
+                    class:collapsed={!showCoverage}
+                    title={showCoverage ? "Collapse coverage" : "Expand coverage"}
+                    aria-label={showCoverage ? "Collapse coverage" : "Expand coverage"}
+                    aria-expanded={showCoverage}
+                    disabled={alignTracks.length === 0}
+                    onclick={() => (showCoverage = !showCoverage)}
+                  >{showCoverage ? "▾" : "▸"}</button>
                 {:else if band.id.startsWith("ann:")}
                   {@const annMeta = viewerLayout.annTracks.find((t) => t.top === band.top)}
-                  <label class="gutter-check">
-                    <input
-                      type="checkbox"
-                      checked={annTrackStates.find((t) => t.path === annMeta?.path)?.visible ?? true}
-                      onchange={(e) =>
-                        annMeta && setAnnTrackVisible(annMeta.path, (e.currentTarget as HTMLInputElement).checked)}
-                    />
-                  </label>
+                  {@const annExpanded =
+                    annTrackStates.find((t) => t.path === annMeta?.path)?.visible ?? true}
+                  <button
+                    type="button"
+                    class="gutter-collapse"
+                    class:collapsed={!annExpanded}
+                    title={annExpanded ? `Collapse ${band.label}` : `Expand ${band.label}`}
+                    aria-label={annExpanded ? `Collapse ${band.label}` : `Expand ${band.label}`}
+                    aria-expanded={annExpanded}
+                    onclick={() => annMeta && setAnnTrackVisible(annMeta.path, !annExpanded)}
+                  >{annExpanded ? "▾" : "▸"}</button>
                 {:else}
                   <span class="gutter-spacer"></span>
                 {/if}
@@ -1678,16 +2329,27 @@
               </div>
             {/if}
           {/each}
-          {#if showReadsTrack && viewerLayout.reads}
-            <div class="gutter-row gutter-reads">
-              <label class="gutter-check">
-                <input type="checkbox" bind:checked={showReadPileup} disabled={!alignDoc} />
-              </label>
-              <span class="gutter-label">Alignments</span>
+          {#each viewerLayout.readsTracks as rd (rd.id)}
+            <div
+              class="gutter-row gutter-reads"
+              class:collapsed={rd.collapsed}
+              style:height={rd.collapsed ? `${rd.height}px` : undefined}
+            >
+              <button
+                type="button"
+                class="gutter-collapse"
+                class:collapsed={!showReadPileup}
+                title={showReadPileup ? "Collapse alignments" : "Expand alignments"}
+                aria-label={showReadPileup ? "Collapse alignments" : "Expand alignments"}
+                aria-expanded={showReadPileup}
+                disabled={alignTracks.length === 0}
+                onclick={() => (showReadPileup = !showReadPileup)}
+              >{showReadPileup ? "▾" : "▸"}</button>
+              <span class="gutter-label">{rd.label}</span>
             </div>
-          {/if}
+          {/each}
         </div>
-        <div class="track-plots">
+        <div class="track-plots" bind:this={plotsEl}>
           <div class="fixed-tracks">
             <canvas
               bind:this={canvasEl}
@@ -1697,12 +2359,18 @@
               onpointermove={onCanvasPointerMove}
               onpointerup={onCanvasPointerUp}
               onpointercancel={onCanvasPointerUp}
+              onlostpointercapture={onCanvasLostPointerCapture}
               ondblclick={onCanvasDoubleClick}
-              onwheel={onCanvasWheel}
+              onwheel={onFixedTracksWheel}
             ></canvas>
           </div>
-          {#if showReadsTrack}
-            <div class="reads-scroll">
+          {#if readsAvailable}
+            <div
+              class="reads-scroll"
+              class:collapsed={viewerLayout.readsTracks.every((t) => t.collapsed)}
+              style:min-height={viewerLayout.readsTracks.every((t) => t.collapsed) ? "0" : undefined}
+              style:flex={viewerLayout.readsTracks.every((t) => t.collapsed) ? "0 0 auto" : undefined}
+            >
               <canvas
                 bind:this={readsCanvasEl}
                 class="view-canvas"
@@ -1711,8 +2379,9 @@
                 onpointermove={onCanvasPointerMove}
                 onpointerup={onCanvasPointerUp}
                 onpointercancel={onCanvasPointerUp}
+                onlostpointercapture={onCanvasLostPointerCapture}
                 ondblclick={onCanvasDoubleClick}
-                onwheel={onCanvasWheel}
+                onwheel={onReadsWheel}
               ></canvas>
             </div>
           {/if}
@@ -1726,7 +2395,7 @@
             · MAPQ {selectedRead.mapq}
             · {selectedRead.strand}
             · {flagSummary(selectedRead)}
-            · CIGAR {selectedRead.cigar}
+            · CIGAR {selectedRead.cigar || "—"}
             · Q̄ {meanQuality(selectedRead)}
           </span>
         {:else if selectedFeature}
@@ -1744,7 +2413,7 @@
           </span>
         {:else if contigLength > 0}
           <span class="footer-hint">
-            Drag to pan · Shift+drag to select · wheel zoom · overview scrub · +/− keys
+            Drag to pan · Shift+drag select · wheel pan · Ctrl+wheel zoom · scroll alignments · +/− keys
             {#if readPack.hiddenCount > 0} · +{readPack.hiddenCount} reads hidden (zoom in){/if}
           </span>
         {/if}
@@ -1773,15 +2442,18 @@
     display: flex;
     flex-direction: column;
     min-height: 0;
-    flex: 1;
+    flex: 1 1 auto;
+    height: 100%;
+    width: 100%;
   }
 
   .toolbar {
     display: flex;
     align-items: center;
     gap: 6px;
-    margin-bottom: 6px;
+    margin-bottom: 8px;
     flex-wrap: wrap;
+    flex: 0 0 auto;
   }
 
   .compact-select,
@@ -1903,6 +2575,13 @@
     background: var(--chip-border);
   }
 
+  .pop-hint {
+    margin: 4px 6px 2px;
+    font-size: 0.7rem;
+    color: var(--text-faint);
+    line-height: 1.35;
+  }
+
   .filters-menu {
     min-width: 200px;
   }
@@ -1982,12 +2661,27 @@
     background: var(--chip-bg);
     color: var(--text-primary);
     border: 1px solid var(--chip-border);
+    transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+  }
+
+  .ghost:hover:not(:disabled) {
+    background: var(--menu-hover-bg);
+    border-color: var(--chip-active-border);
   }
 
   .primary {
     background: var(--primary-bg);
     color: var(--primary-text);
     box-shadow: var(--primary-shadow);
+    transition: filter 0.12s ease, transform 0.12s ease;
+  }
+
+  .primary:hover:not(:disabled) {
+    filter: brightness(1.05);
+  }
+
+  .primary:active:not(:disabled) {
+    transform: translateY(0.5px);
   }
 
   .primary:disabled,
@@ -1998,18 +2692,21 @@
 
   .viewer {
     flex: 1 1 auto;
-    min-height: 220px;
+    min-height: 0;
+    height: 100%;
     display: flex;
     flex-direction: column;
-    border-radius: 4px;
+    border-radius: 8px;
     border: 1px solid var(--view-track-border, var(--panel-border));
     overflow: hidden;
     background: var(--view-canvas-bg, #f7f7f7);
     outline: none;
+    box-shadow: 0 1px 0 rgba(255, 255, 255, 0.03) inset;
   }
 
   .viewer:focus-visible {
     border-color: var(--chip-active-border);
+    box-shadow: 0 0 0 2px var(--focus-ring, rgba(53, 206, 231, 0.25));
   }
 
   .viewer-main {
@@ -2017,10 +2714,12 @@
     min-height: 0;
     display: flex;
     flex-direction: row;
+    width: 100%;
   }
 
   .track-gutter {
     flex: 0 0 auto;
+    width: 108px;
     display: flex;
     flex-direction: column;
     border-right: 1px solid var(--view-track-border, var(--panel-border));
@@ -2045,21 +2744,52 @@
     padding-top: 4px;
   }
 
-  .gutter-check {
-    display: flex;
-    margin: 0;
+  .gutter-row.gutter-reads.collapsed {
     flex: 0 0 auto;
+    min-height: 0;
+    align-items: center;
+    padding-top: 0;
   }
 
-  .gutter-check input {
+  .gutter-row.collapsed {
+    opacity: 0.85;
+  }
+
+  .gutter-collapse {
+    flex: 0 0 14px;
+    width: 14px;
+    height: 14px;
     margin: 0;
-    width: 12px;
-    height: 12px;
+    padding: 0;
+    border: none;
+    border-radius: 3px;
+    background: transparent;
+    color: var(--text-muted);
+    font-size: 0.72rem;
+    line-height: 1;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .gutter-collapse:hover:not(:disabled) {
+    color: var(--text-primary);
+    background: var(--menu-hover-bg);
+  }
+
+  .gutter-collapse:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+  }
+
+  .gutter-collapse.collapsed {
+    color: var(--accent-highlight, var(--text-menu));
   }
 
   .gutter-spacer {
-    width: 12px;
-    flex: 0 0 12px;
+    width: 14px;
+    flex: 0 0 14px;
   }
 
   .gutter-label {
@@ -2071,9 +2801,16 @@
     line-height: 1.2;
   }
 
+  .reads-scroll.collapsed {
+    flex: 0 0 auto;
+    min-height: 0;
+    overflow: hidden;
+  }
+
   .track-plots {
     flex: 1 1 auto;
     min-width: 0;
+    width: 100%;
     display: flex;
     flex-direction: column;
     min-height: 0;
@@ -2081,19 +2818,22 @@
 
   .fixed-tracks {
     flex: 0 0 auto;
+    width: 100%;
   }
 
   .reads-scroll {
     flex: 1 1 auto;
-    min-height: 120px;
+    min-height: 100px;
     overflow-x: hidden;
     overflow-y: auto;
     border-top: 1px solid var(--view-track-border, var(--panel-border));
+    width: 100%;
   }
 
   .view-canvas {
     display: block;
     width: 100%;
+    max-width: 100%;
     cursor: default;
     touch-action: none;
   }
